@@ -1,0 +1,111 @@
+# GB200 NVL72 MNNVL SHARP All-Reduce Sample
+
+## Summary
+- Build a standalone sample named `mnnvl_sharp_allreduce`.
+- Use `MPI + CUDA Driver API` with one rank per selected GPU: 4 ranks total across 2 trays.
+- Fix the default GPU placement to the requested layout: tray 0 uses `{0,2}` and tray 1 uses `{1,3}`.
+- Use raw CUDA virtual memory management, IMEX fabric handles, multicast objects, and `multimem` PTX so the sample explicitly exercises MNNVL symmetric memory and NVLink SHARP.
+- Execute the SHARP path only for `FP8 E4M3`; report `NVFP4` and `MXFP4` unsupported under the chosen CUDA 13.0 programming path.
+- Assume the rack remains on the default 72-GPU NVLink partition and that the selected trays are members of the same healthy IMEX domain. In the single-user setup, `channel0` on each selected node is sufficient.
+
+## Key Changes
+- Public interface:
+  - `--tray0-gpus 0,2`
+  - `--tray1-gpus 1,3`
+  - `--bytes 1073741824`
+  - `--warmup 3`
+  - `--iters 20`
+  - `--types auto|e4m3`
+  - `--cpu-ref-sample-bytes 16777216`
+  - `--json`
+- Launch and topology:
+  - Run with `mpirun -np 4 --map-by ppr:2:node`; hostfile order defines tray 0 then tray 1.
+  - Map local rank `0` and `1` to the two configured local GPUs on each tray.
+  - Query `CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID` for the selected GPUs and fail if the two GPUs on a tray resolve to the same NUMA CPU.
+  - Pin each rank to the NUMA CPU nearest its GPU.
+- Preflight model:
+  - Treat `NVLink domain`, `NVLink partition`, `IMEX domain`, and `IMEX channel` as distinct checks.
+  - Require `nvidia-imex` running on each selected tray.
+  - Require `channel0` visible on each selected tray.
+  - Require matching `/etc/nvidia-imex/nodes_config.cfg` membership and healthy `nvidia-imex-ctl -N` state for the selected trays.
+  - Require an operator-side fabric check with `nv show sdn partition`; accepted default state is one healthy `Default Partition` covering all `72` GPUs in the rack.
+  - Require `CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED`, `CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED`, and `CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED` on all four GPUs.
+- Symmetric memory:
+  - Each rank allocates `1 GiB` with `cuMemCreate` using `CU_MEM_HANDLE_TYPE_FABRIC`, rounded up to the max of VMM and multicast granularity.
+  - Export the local fabric handle over MPI, import all four handles on every rank, and map a 4-slot unicast symmetric table `uc_slots[4]`.
+  - Slot order is global-rank order and is identical on every rank.
+- SHARP path:
+  - Rank 0 creates one `1 GiB` multicast object with `numDevices=4`, exports it, and all ranks import it.
+  - Every rank adds its local GPU to the multicast object and binds its own local allocation with `cuMulticastBindMem`.
+  - Every rank maps one multicast alias `mc_alias` to the same physical memory already visible through `uc_slots[self]`.
+  - Use `fence.proxy.alias` before SHARP reads and before post-SHARP unicast validation reads.
+  - Run the SHARP kernel on global rank 0 only:
+    - grid-stride over packed `e4m3x4`
+    - `multimem.ld_reduce.add.acc::f16.e4m3x4`
+    - `multimem.st.e4m3x4`
+- Datatype and reference handling:
+  - Runtime datatype reporting is split into device multicast support and compiled `multimem` support for the local Blackwell target.
+  - Report:
+    - `FP8 E4M3`: supported
+    - `NVFP4`: unsupported
+    - `MXFP4`: unsupported
+  - Implement deterministic `E4M3` initialization using packed `e4m3x4`.
+  - Compare the SHARP result against:
+    - a semantic CPU reference: `E4M3 -> F16 accumulation -> E4M3`
+    - a precision CPU reference: `float32`
+  - Use full-buffer hashes for replica identity and sampled host comparison by default for precision metrics.
+- Deliverables:
+  - `CMakeLists.txt`
+  - `README.md`
+  - `scripts/preflight_imex.sh`
+  - `scripts/run_mnnvl_sharp.sh`
+  - `src/main.cc`
+  - `src/config.*`
+  - `src/runtime.*`
+  - `src/fabric_memory.*`
+  - `src/sharp_kernels.cu`
+  - `src/e4m3_ref.*`
+
+## Test Plan
+- Preflight test:
+  - selected trays expose `channel0`
+  - selected trays have matching `nodes_config.cfg`
+  - `nvidia-imex-ctl -N` is healthy for the selected trays
+  - operator confirms the trays are in the same NVLink partition, with the default expected case being one 72-GPU partition
+  - all four GPUs pass VMM, fabric-handle, and multicast capability checks
+- Topology test:
+  - tray 0 GPUs `{0,2}` must have different `HOST_NUMA_ID`s
+  - tray 1 GPUs `{1,3}` must have different `HOST_NUMA_ID`s
+- Symmetric-memory smoke test:
+  - write per-rank canaries into `uc_slots[self]`
+  - read back peer canaries from every imported remote slot
+- Functional test:
+  - `auto` type query must execute only `FP8 E4M3`
+  - `NVFP4` and `MXFP4` must be reported unsupported and skipped
+- Correctness test:
+  - reconstruct the same 4 input buffers on CPU on rank 0
+  - compare against both semantic and precision CPU references
+  - after SHARP, each rank hashes its final local result; all four hashes must match
+  - rank 0 checks bytewise equality against the semantic reference for the validated region
+- Timing test:
+  - reinitialize before each measured iteration
+  - 3 warmups, 20 measured iterations
+  - CUDA events around only the SHARP kernel on rank 0
+  - report min/median/p95 latency and effective logical all-reduce bandwidth
+
+## Assumptions
+- Raw CUDA is the chosen path; NCCL is not used for the collective.
+- MPI is used only for process launch, control-plane handle exchange, and barriers; CUDA-aware MPI is not required.
+- Hostfile order defines which node is tray 0 vs tray 1.
+- The default rack configuration is one healthy 72-GPU NVLink partition.
+- A rack-wide IMEX domain is acceptable even if the job uses only 2 trays, as long as the selected trays are healthy members of that same domain.
+- The only SHARP-relevant datatype from the candidate list on CUDA 13.0 GB200 is `FP8 E4M3`; `NVFP4` and `MXFP4` are not directly exposed by CUDA 13.0 `multimem` reductions.
+- Primary references:
+  - [IMEX overview](https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/overview.html)
+  - [IMEX getting started](https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/gettingstarted.html)
+  - [IMEX channels](https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/imexchannels.html)
+  - [IMEX deployment](https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/deployment.html)
+  - [CUDA 13.0 programming guide](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-c-programming-guide/index.html)
+  - [CUDA 13.0 driver API](https://docs.nvidia.com/cuda/archive/13.0.0/pdf/CUDA_Driver_API.pdf)
+  - [PTX 13.0.1 multimem support](https://docs.nvidia.com/cuda/archive/13.0.1/hopper-tuning-guide/parallel-thread-execution/index.html)
+  - [NVIDIA multi-gpu-programming-models](https://github.com/NVIDIA/multi-gpu-programming-models)
