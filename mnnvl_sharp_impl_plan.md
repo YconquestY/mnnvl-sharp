@@ -2,11 +2,12 @@
 
 ## Summary
 - Implement a standalone CUDA 13.1 + MPI sample named `mnnvl_sharp_allreduce`.
-- The sample will run on 2 GB200 NVL72 compute trays with 2 MPI ranks per tray and 1 GPU per rank.
-- The selected CUDA containers, SSH/control-plane addresses, SSH ports, and local CUDA device indices will come from a rack YAML file.
+- The sample will run one MPI rank per selected GPU, with the selected ranks drawn from a rack YAML file that can describe up to 18 compute trays and up to 4 GPUs per tray.
+- The selected CUDA containers, SSH/control-plane addresses, SSH ports, and local CUDA device indices will come from the rack YAML file.
 - The implementation will use CUDA Driver API virtual memory management, IMEX fabric handles, multicast objects, and inline PTX `multimem` instructions for the SHARP path.
 - The sample will only execute the SHARP all-reduce for `FP8 E4M3`. It will detect and report `NVFP4` and `MXFP4` as unsupported under the chosen CUDA 13.1 programming path.
-- The sample will produce correctness, precision, and timing output in a single run.
+- The sample will produce correctness, precision, SHARP timing, and peer-access initialization timing output in a single run.
+- The benchmark tooling will sweep rank counts `4, 8, 16, 32, 64, 72` from the same rack YAML and generate an initialization-latency graph.
 - The implementation assumes the rack remains on the default 72-GPU NVLink partition and that the selected trays are members of the same IMEX domain.
 
 ## Deliverables
@@ -14,6 +15,8 @@
 - `README.md`
 - `scripts/preflight_imex.sh`
 - `scripts/run_mnnvl_sharp.sh`
+- `scripts/run_init_sweep.py`
+- `scripts/plot_init_latency.py`
 - `src/main.cc`
 - `src/config.h`
 - `src/config.cc`
@@ -45,7 +48,11 @@
 - `scripts/preflight_imex.sh`
   - Validate host prerequisites before attempting the run.
 - `scripts/run_mnnvl_sharp.sh`
-  - Provide a reproducible two-node launch wrapper around `mpirun`.
+  - Provide a reproducible rank-count-aware launch wrapper around `mpirun`.
+- `scripts/run_init_sweep.py`
+  - Sweep rank counts from one rack YAML and collect JSON results.
+- `scripts/plot_init_latency.py`
+  - Convert sweep CSV output into a PNG graph of initialization latency versus rank count.
 
 ## Build Plan
 - Use CMake with a single executable target `mnnvl_sharp_allreduce`.
@@ -58,6 +65,7 @@
 - Helper-script requirements:
   - Python 3
   - PyYAML for extracting MPI host order from `rack.yaml`
+  - matplotlib for plotting sweep output
 - Link against:
   - `CUDA::cudart`
   - `CUDA::cuda_driver`
@@ -74,11 +82,14 @@
 ## CLI and Runtime Contract
 - CLI:
   - `--rack-config rack.yaml`
+  - `--rank-count <N>` with default `MPI_COMM_WORLD` size
+  - `--rank-selection balanced|prefix` with default `balanced`
   - `--bytes 1073741824`
   - `--warmup 3`
   - `--iters 20`
   - `--types auto|e4m3`
   - `--reference-check-bytes <N>` with default `16777216`
+  - `--init-only` to stop after peer-access initialization, smoke test, and JSON reporting
   - `--json` to emit one machine-readable summary line
 - Rack YAML schema:
   ```yaml
@@ -86,43 +97,56 @@
     - GB200-Rack5-01:
         - hostname: 10.135.1.31
         - port: 4399
-        - device: [0, 2]
+        - device: [0, 1, 2, 3]
     - GB200-Rack5-02:
         - hostname: 10.135.1.32
         - device:
+            - 0
             - 1
+            - 2
             - 3
+    # ...
+    - GB200-Rack5-18:
+        - hostname: 10.135.1.48
+        - device: [0, 1, 2, 3]
   ```
 - Rack YAML compatibility:
   - Canonical form is the sequence-of-single-key-maps form shown above.
   - `port` is optional and defaults to `4399`.
-  - `device` must be a YAML sequence and may be written inline as `[0, 2]` or as a block list.
+  - `device` must be a YAML sequence with 1 to 4 unique CUDA device indices and may be written inline as `[0, 2]` or as a block list.
   - The parser will reject scalar or comma-separated string device values such as `"0,2"`.
 - Rack YAML semantics:
   - The key under each `rack` item is the compute-tray host label and should match `hostname` output on that tray.
   - `hostname` is the SSH/control-plane address used to reach the CUDA container.
   - `port` is the SSH port for the CUDA container.
   - `device` is an ordered list of local CUDA device indices to use inside that container.
-  - YAML order defines rack-entry order, tray order, and MPI host order.
+  - YAML order defines rack-entry order, tray order, and rank-selection input order.
   - The CUDA container is assumed to be privileged and started with host networking and IPC, such as `--net=host --ipc=host`, so CUDA, NIC, memory, IMEX, and NVLink resources match the host machine.
   - `--rack-config` should be passed as an absolute path that is readable at the same path inside every selected container; `scripts/run_mnnvl_sharp.sh` will resolve it with `realpath` and check readability over SSH before launch.
 - Flag semantics:
+  - `--rank-count` is the number of ranks selected from the full YAML inventory and must match `MPI_COMM_WORLD` size when provided.
+  - `--rank-selection balanced` selects device slot 0 across all trays, then slot 1 across all trays, and so on until `N` ranks are selected.
+  - `--rank-selection prefix` selects trays in YAML order and devices in each tray's listed order until `N` ranks are selected.
   - `--reference-check-bytes` is the number of leading payload bytes compared against CPU references for exactness and precision metrics.
   - Set `--reference-check-bytes` equal to `--bytes` for a full-buffer CPU reference.
 - Invariants:
-  - `world_size == 4`
-  - exactly `2` ranks per selected container
-  - exactly `2` unique rack entries
-  - `rack.yaml` contains exactly `2` rack entries for this v1 sample
-  - each rack entry contains exactly `2` unique local CUDA device ordinals
+  - `1 <= rack entry count <= 18`
+  - `1 <= device count per rack entry <= 4`
+  - total available ranks is `sum(entry.devices.size())` and must be at most `72`
+  - `1 <= world_size <= total available ranks`
+  - if `--rank-count` is provided, `world_size == rank_count`
   - `bytes` is a multiple of `4` because the implementation uses packed `e4m3x4`
-- Rack-entry/rank mapping:
+- Rank selection and mapping:
+  - Parse the full YAML into an ordered rank inventory of `(rack entry, device)`.
+  - Build the selected rank plan from `--rank-count` and `--rank-selection`.
+  - Compute per-container slot counts from the selected rank plan.
   - Determine local rank with `MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, ...)`.
   - Gather container OS hostnames across `MPI_COMM_WORLD`.
   - Match the local OS hostname to a rack YAML key after normalizing short hostname vs FQDN.
   - If the OS hostname cannot be matched, allow `MNNVL_HOST_LABEL` to override the host label for that process.
-  - Local rank `0` maps to the first device in the matched rack entry. Local rank `1` maps to the second device in the matched rack entry.
-  - The launcher must start containers in YAML order so global rank order remains deterministic.
+  - Use `selected_rank_plan[world_rank]` as the authoritative `(container, GPU)` target for the rank.
+  - Validate that the current container host label matches `selected_rank_plan[world_rank].host_label`.
+  - Validate that local MPI process count for each container equals the selected slot count for that container.
 - CPU affinity:
   - Query `CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID` for the selected GPU.
   - Read `/sys/devices/system/node/node<id>/cpulist`.
@@ -136,7 +160,7 @@
   - `IMEX channel` is the user/job isolation device node. In the single-user rack-wide setup, `channel0` on each selected node is sufficient.
 - No extra partition configuration is required if the rack is still using the default partition:
   - expected state is one healthy `Default Partition` covering all `72` GPUs in the rack
-  - if user partitions have been created, the selected two trays must belong to the same NVLink partition or the sample must fail preflight
+  - if user partitions have been created, all selected trays must belong to the same NVLink partition or the sample must fail preflight
 - `scripts/preflight_imex.sh` will support:
   - local-only mode: validate the current node
   - rack mode: `./scripts/preflight_imex.sh rack.yaml`
@@ -162,13 +186,13 @@
   - IMEX channel inventory
   - normalized `nodes_config.cfg` membership
   - IMEX domain health
-  - a note that GPU-to-NUMA uniqueness for the selected pairs will be revalidated inside the binary
+  - a note that selected GPU-to-NUMA mapping will be revalidated inside the binary
 - The script will enforce the following policy:
   - every selected node must expose `channel0`
   - every selected container's `hostname` output must match the corresponding rack YAML key, unless the user documents that `MNNVL_HOST_LABEL` will be used at launch
   - every selected container must have identical normalized `nodes_config.cfg` contents
   - `nvidia-imex-ctl -N` in every selected container must show all nodes from `nodes_config.cfg` in `READY` state, or explicitly mark unreachable nodes as out of scope if the deployment is intentionally per-job
-  - if `nodes_config.cfg` contains more than the 2 selected trays, that is acceptable for this sample as long as the selected trays are in the same healthy IMEX domain
+  - if `nodes_config.cfg` contains more than the selected trays, that is acceptable for this sample as long as the selected trays are in the same healthy IMEX domain
 - External admin-side NVLink partition verification:
   - this cannot be verified from the CUDA process on the compute tray
   - required command on the leader NVSwitch or NMX endpoint:
@@ -182,7 +206,7 @@
   - `CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED`
   - `CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED`
   - `CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED`
-  - selected GPU pair on each tray does not resolve to the same `HOST_NUMA_ID`
+  - every selected GPU resolves to a valid `HOST_NUMA_ID`
   - requested allocation size is compatible with both VMM and multicast granularity
   - imported-memory operations fail fast with a clear error if the runtime IMEX membership or permissions are inconsistent with the preflight assumptions
 
@@ -190,19 +214,35 @@
 - `Config`
   - parsed CLI values
   - rack config path
+  - optional rank count
+  - rank-selection policy
   - reference-check byte count
   - byte counts
   - iteration counts
+  - init-only mode
   - output mode
 - `RackEntry`
   - `host_label`
   - `control_hostname`
   - `ssh_port`
   - ordered local CUDA device list
+- `RankTarget`
+  - `rank_index_in_plan`
+  - `rack_index`
+  - `host_label`
+  - `control_hostname`
+  - `ssh_port`
+  - `gpu_ordinal`
+- `RankPlan`
+  - ordered selected rank targets
+  - per-host selected device lists
+  - per-host MPI slot counts
+  - helper to emit MPI host aliases as `<host_label>:<selected_count>`
+  - helper to emit an Open MPI rankfile so `world_rank == RankTarget.rank_index_in_plan`
 - `RackConfig`
   - ordered list of `RackEntry`
   - helper lookup by host label
-  - helper to emit MPI host aliases as `<host_label>:2`
+  - helper to count available rank targets
   - helper to emit an SSH config with per-host `HostName` and `Port`
 - `RankInfo`
   - `world_rank`
@@ -229,10 +269,13 @@
   - rounded allocation size
   - exported opaque fabric handle bytes
   - local unicast base VA
-  - slot pointers `uc_slots[4]`
+  - vector-backed slot pointers `uc_slots[world_size]`
   - multicast object handle
   - multicast alias pointer `mc_alias`
 - `RunStats`
+  - peer-access initialization local latency
+  - peer-access initialization min, median, p95, max across ranks
+  - peer-access initialization global max latency
   - warmup latencies
   - measured latencies
   - end-to-end wall times
@@ -248,20 +291,20 @@
   - Query multicast granularity via `cuMulticastGetGranularity`.
   - Round `bytes` up to `alloc_bytes = align_up(bytes, max(vmm_granularity, mc_granularity))`.
 - Export/import:
+  - Run `MPI_Barrier(world)` immediately before peer-access initialization.
+  - Start a local wall-clock timer with `MPI_Wtime()`.
   - Export the local physical allocation to an opaque fabric-shareable handle.
   - Exchange fixed-size serialized handle blobs with `MPI_Allgather`.
-  - Import all four handles on every rank.
+  - Import all selected-rank handles on every rank.
 - Symmetric unicast mapping:
-  - Reserve one contiguous VA range of size `4 * alloc_bytes`.
+  - Reserve one contiguous VA range of size `world_size * alloc_bytes`.
   - Map the imported physical handle for global rank `r` at `base + r * alloc_bytes`.
   - Set read-write access on the local device for every slot.
-  - Publish:
-    - `uc_slots[0]`
-    - `uc_slots[1]`
-    - `uc_slots[2]`
-    - `uc_slots[3]`
+  - Stop the local timer after all imported rank slots are mapped and access permissions are set.
+  - Use `MPI_Allgather` or `MPI_Allreduce` to report per-rank peer-init latencies and the global max latency.
+  - Publish `uc_slots[world_size]` in global-rank order.
 - Multicast object:
-  - Rank 0 creates a single multicast object sized to `alloc_bytes` and configured for `4` devices.
+  - Rank 0 creates a single multicast object sized to `alloc_bytes` and configured for `world_size` devices.
   - Rank 0 exports the multicast shareable handle and broadcasts it via MPI.
   - All ranks import the multicast object handle.
   - Each rank adds its local GPU to the multicast object.
@@ -281,39 +324,47 @@
 
 ## Execution Sequence
 1. Parse CLI, parse `rack.yaml`, and initialize MPI.
-2. Discover `world_rank`, `local_rank`, hostname set, matched rack entry, and selected GPU ordinal.
-3. Select CUDA device, obtain current context, query capability attributes, query `HOST_NUMA_ID`, and pin CPU affinity.
-4. Validate:
-   - 4 ranks total
-   - 2 ranks per selected container
-   - 2 rack entries in the YAML
-   - 2 unique device indices per rack entry
+2. Build the rank plan from the YAML inventory, `--rank-count`, and `--rank-selection`.
+3. Discover `world_rank`, `local_rank`, hostname set, matched rack entry, and selected GPU ordinal from the rank plan.
+4. Select CUDA device, obtain current context, query capability attributes, query `HOST_NUMA_ID`, and pin CPU affinity.
+5. Validate:
+   - `world_size == selected rank count`
+   - selected rank count is at most total YAML devices
+   - per-container MPI local size matches selected per-container slot count
    - every MPI host maps to exactly one rack entry
-   - different NUMA CPU per selected local GPU pair
    - all GPUs support VMM, fabric handles, and multicast
-5. Determine datatype support:
+6. Determine datatype support:
    - `FP8 E4M3` is enabled only when both compile-time and runtime checks pass.
    - `NVFP4` and `MXFP4` are always reported unsupported in this implementation.
-6. Allocate local fabric memory, export/import handles, and build the 4-slot symmetric unicast table.
-7. Create/import the multicast object and map the `mc_alias`.
-8. Run the symmetric-memory smoke test:
+7. Allocate local physical fabric memory without mapping peer slots.
+8. Run timed peer-access initialization:
+   - global barrier
+   - export local fabric handle
+   - all-gather all selected handles
+   - import handles
+   - reserve/map `world_size` peer slots
+   - set access permissions
+   - stop local timer and report global max latency
+9. Create/import the multicast object and map the `mc_alias`.
+10. Run the symmetric-memory smoke test:
    - each rank writes a canary to `uc_slots[self]`
-   - all ranks read the canaries from all 4 slots
+   - all ranks read the canaries from all selected rank slots
    - fail immediately if any readback mismatches
-9. Initialize the local buffer for the supported datatype.
-10. Run warmup iterations:
+11. If `--init-only` is set, print JSON/human summary and skip SHARP all-reduce, CPU reference, and timing loops.
+12. Initialize the local buffer for the supported datatype.
+13. Run warmup iterations:
     - reinitialize local buffer
     - global barrier
     - alias fence
     - SHARP kernel on rank 0
     - global barrier
-11. Run measured iterations:
+14. Run measured iterations:
     - same flow as warmup
     - capture CUDA event elapsed time on rank 0
     - capture wall-clock elapsed time around the collective on all ranks
-12. Copy the final buffer to host and gather per-rank hashes.
-13. Rank 0 reconstructs host references, compares results, and prints the report.
-14. Tear down mappings, handles, and MPI state.
+15. Copy the final buffer to host and gather per-rank hashes.
+16. Rank 0 reconstructs host references, compares results, and prints the report.
+17. Tear down mappings, handles, and MPI state.
 
 ## Kernel Plan
 - `init_e4m3_kernel(uint32_t* dst_words, size_t word_count, int world_rank)`
@@ -358,7 +409,7 @@
   - `void cpu_allreduce_e4m3_semantic(...)`
   - `void cpu_allreduce_e4m3_f32(...)`
 - Semantic reference:
-  - regenerate all 4 input buffers using the exact same deterministic formula as the device initializer
+  - regenerate all selected-rank input buffers using the exact same deterministic formula as the device initializer
   - decode each `E4M3` element to float
   - accumulate rank contributions in `FP16` rounding after each add
   - re-encode the final result to `E4M3`
@@ -378,6 +429,14 @@
   - allow full-buffer CPU reference by setting `--reference-check-bytes` equal to `--bytes`
 
 ## Timing Plan
+- Peer-access initialization timing:
+  - local physical allocation is completed before the timed region
+  - all ranks enter `MPI_Barrier(world)`
+  - all ranks start `MPI_Wtime()`
+  - timed work includes fabric-handle export, handle all-gather, handle import, VA reservation, peer mapping, and access-permission setup
+  - each rank stops its local timer after its peer mappings are usable
+  - rank 0 reports min, median, p95, max, and global max over local peer-init timings
+  - the sweep graph uses the global max peer-init latency as the y value
 - Device timing:
   - rank 0 records CUDA events immediately before and after the SHARP kernel
   - report min, median, p95, and max over measured iterations
@@ -390,7 +449,7 @@
   - reduce the maximum wall time across ranks per iteration
   - report min, median, and p95 of the global max latency
 - Bandwidth reporting:
-  - logical all-reduce bytes = `4 * bytes`
+  - logical all-reduce bytes = `world_size * bytes`
   - effective logical bandwidth = `logical_bytes / device_time`
   - print the metric with a note that it is a logical collective bandwidth, not raw link bandwidth
 
@@ -400,6 +459,7 @@
   - detected NUMA IDs
   - capability matrix
   - datatype support matrix
+  - peer-access initialization timing
   - smoke-test result
   - correctness result
   - precision metrics
@@ -410,6 +470,8 @@
     - hostname mapping
     - GPU mapping
     - datatype support
+    - selected rank count
+    - peer initialization timing
     - exact-match result
     - precision metrics
     - timing stats
@@ -422,54 +484,80 @@
   - behavior:
     - local mode validates IMEX service, channel devices, local `nodes_config.cfg`, and local topology
     - rack mode parses `rack.yaml`, SSHes to each container using its `hostname` and optional `port`, compares `nodes_config.cfg` across the selected containers, and summarizes `nvidia-imex-ctl -N` state for each container
+    - rack mode accepts 1 to 18 rack entries and 1 to 4 devices per entry
     - prints a reminder that NVLink partition verification is an external switch-side admin check, not a compute-node check
 - `scripts/run_mnnvl_sharp.sh`
   - usage:
-    - `./scripts/run_mnnvl_sharp.sh rack.yaml`
+    - `./scripts/run_mnnvl_sharp.sh rack.yaml [--rank-count N] [mnnvl_sharp_allreduce args...]`
   - behavior:
     - build the project if needed
-    - derive the MPI host list from `rack.yaml` with PyYAML by using each rack entry's host label with two slots
+    - derive selected rank plan from `rack.yaml`, `--rank-count`, and `--rank-selection`
+    - derive the MPI host list from the selected rank plan by using each selected host label with its selected slot count
     - generate a temporary SSH config mapping each host label to its `hostname` and `port`
+    - generate a temporary Open MPI rankfile mapping each global rank to its selected host label and per-host local slot index
     - resolve `rack.yaml` to an absolute path and verify the same path is readable inside every selected container
     - verify the executable path is present and executable inside every selected container
-    - run `mpirun -np 4 --host <label0>:2,<label1>:2 --map-by ppr:2:node --mca plm_rsh_args "-F <tmp-ssh-config>" ./build/mnnvl_sharp_allreduce --rack-config <abs-rack-yaml>`
+    - run `mpirun -np <rank-count> --host <label0>:<slots0>,<label1>:<slots1> --rankfile <tmp-rankfile> --mca plm_rsh_args "-F <tmp-ssh-config>" ./build/mnnvl_sharp_allreduce --rack-config <abs-rack-yaml> --rank-count <rank-count>`
     - pass through additional CLI arguments after the rack config path
     - print a warning if the preflight summary indicates that the selected containers are in a larger rack-wide IMEX domain than the job itself
+- `scripts/run_init_sweep.py`
+  - usage:
+    - `scripts/run_init_sweep.py rack.yaml --rank-counts 4,8,16,32,64,72 --repeats 3 --out-dir results/init_sweep`
+  - behavior:
+    - parse the full rack YAML and compute total available ranks
+    - filter default rank counts to values not exceeding total available ranks
+    - include total available ranks if it is at least 4 and not already in the rank-count list
+    - for each rank count and repeat, invoke `scripts/run_mnnvl_sharp.sh rack.yaml --rank-count <N> --init-only --json`
+    - parse rank-0 JSON and append one CSV row per run
+    - write `init_latency.csv` with columns `rank_count,repeat,peer_init_ms,peer_init_min_ms,peer_init_median_ms,peer_init_p95_ms,peer_init_max_ms`
+    - call `scripts/plot_init_latency.py` after all runs complete
+- `scripts/plot_init_latency.py`
+  - usage:
+    - `scripts/plot_init_latency.py results/init_sweep/init_latency.csv --output results/init_sweep/init_latency.png`
+  - behavior:
+    - group CSV rows by rank count
+    - plot median global-max peer-init latency as the y value
+    - use min/max across repeats as error bars
+    - label x axis `rank count`
+    - label y axis `peer access initialization latency (ms)`
 
 ## Acceptance Criteria
-- The binary launches successfully with 4 ranks across 2 trays.
+- The binary launches successfully for any selected rank count from 1 through the YAML's available rank count, up to 72.
 - The binary accepts `--rack-config rack.yaml` and rejects malformed rack YAML with actionable errors.
 - The launcher can reach each privileged CUDA container using the YAML `hostname` and `port`, with `port` defaulting to `4399`.
 - Preflight confirms that the selected trays are in the same IMEX domain and have access to `channel0`.
 - Operator-side fabric check confirms either:
   - the rack is on the default 72-GPU NVLink partition, or
-  - both trays are in the same user partition.
-- The selected GPU pair on each tray is confirmed to span distinct NUMA CPUs.
+  - all selected trays are in the same user partition.
+- Each selected GPU resolves to a valid host NUMA ID and rank pinning succeeds.
 - Each rank allocates and exposes a 1 GiB fabric-shareable GPU allocation.
-- Every rank can read canaries from all 4 symmetric unicast slots.
+- Every rank can read canaries from all selected symmetric unicast slots.
+- The program reports peer-access initialization latency, including global max `peer_init_ms`.
 - The program reports `E4M3` supported and `NVFP4`/`MXFP4` unsupported.
 - The SHARP kernel executes without access faults or mapping errors.
-- All 4 replicas produce identical final hashes.
+- All selected-rank replicas produce identical final hashes.
 - Rank 0 reports exact byte match against the CPU semantic reference for the validated region.
 - Rank 0 reports numeric error metrics against the float32 reference.
 - Timing statistics are printed when at least 1 measured iteration completes successfully.
+- The sweep script emits a CSV and PNG graph for rank counts `4, 8, 16, 32, 64, 72` when those counts are available.
 
 ## Implementation Order
-1. Set up `CMakeLists.txt`, executable skeleton, CLI parsing, and `yaml-cpp` integration.
-2. Implement rack YAML parsing, MPI topology discovery, rack-entry mapping, GPU selection, and NUMA validation.
-3. Implement CUDA capability checks and CPU affinity pinning.
-4. Implement local fabric allocation plus handle export/import.
-5. Implement symmetric unicast mapping and the canary smoke test.
-6. Implement multicast object creation/import, binding, and alias mapping.
-7. Implement `E4M3` init, alias fence, and rank-0 SHARP kernel.
-8. Implement host-side `E4M3` encode/decode and CPU references.
-9. Implement result hashing, timing, and reporting.
-10. Add helper scripts and README usage documentation.
+1. Extend CLI parsing for `--rank-count`, `--rank-selection`, and `--init-only`.
+2. Extend rack YAML parsing to accept 1 to 18 entries and 1 to 4 devices per entry.
+3. Implement rank-plan construction, per-container slot derivation, MPI topology discovery, GPU selection, and NUMA validation.
+4. Convert fixed-size rank assumptions in runtime and fabric memory code to `world_size` vectors.
+5. Add timed peer-access initialization around fabric-handle export, all-gather, import, mapping, and access setup.
+6. Update multicast object creation/import, binding, and alias mapping for `world_size` devices.
+7. Update canary, hashing, SHARP, and host-reference paths for variable rank count.
+8. Add JSON fields and human-readable output for peer-init timing.
+9. Add rank-count-aware launcher behavior.
+10. Add sweep and plotting scripts plus README usage documentation.
 
 ## Risks and Defaults
-- Default: treat rack YAML order as tray order and MPI host order. The scripts and README must state this explicitly.
+- Default: treat rack YAML order as tray order and rank-selection input order. The scripts and README must state this explicitly.
+- Default: `balanced` rank selection spreads small rank counts across trays before taking additional GPUs from the same tray.
 - Default: assume the NVL72 rack remains on the default 72-GPU NVLink partition unless an operator states otherwise.
-- Default: accept a rack-wide IMEX domain even when the job only uses 2 trays, as long as the selected trays are healthy members of that same domain.
+- Default: accept a rack-wide IMEX domain even when the job only uses a subset of trays, as long as the selected trays are healthy members of that same domain.
 - Default: only `E4M3` is executable in v1. FP4 support remains a reported capability decision, not a runtime path.
 - Risk: CUDA 13.1 Blackwell toolchain naming may differ across environments. The configure step must fail loudly instead of guessing.
 - Risk: exact SHARP semantic behavior may differ from the planned `FP16` accumulation model. If the first hardware run disagrees, the semantic reference becomes the first item to recalibrate using observed results and PTX documentation.
