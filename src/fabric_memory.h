@@ -4,7 +4,6 @@
 
 #include <cuda.h>
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -23,7 +22,10 @@ struct FabricAllocation {
   std::vector<CUmemGenericAllocationHandle> imported_handles;
 
   CUdeviceptr uc_base = 0;
-  std::array<CUdeviceptr, 4> uc_slots{};
+  std::vector<CUdeviceptr> uc_slots;
+
+  double peer_init_local_ms = 0.0;
+  std::vector<double> peer_init_all_ms;
 
   CUmemGenericAllocationHandle multicast_handle = 0;
   CUdeviceptr mc_base = 0;

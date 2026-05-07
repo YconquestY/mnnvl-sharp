@@ -69,10 +69,12 @@ void CheckCudaRuntime(cudaError_t result, const char* expr);
 #define MNNVL_CHECK_CU(expr) ::mnnvl::CheckCu((expr), #expr)
 #define MNNVL_CHECK_CUDA(expr) ::mnnvl::CheckCudaRuntime((expr), #expr)
 
-RankInfo DiscoverRankInfo(MPI_Comm world, const RackConfig& rack);
+RankInfo DiscoverRankInfo(MPI_Comm world, const RackConfig& rack, const RankPlan& plan);
 CapabilityInfo InitializeCudaAndQuery(RankInfo* rank);
 std::vector<RankMappingRecord> GatherRankMappings(MPI_Comm world, const RankInfo& rank);
-void ValidateRankMappings(const std::vector<RankMappingRecord>& records, const RackConfig& rack);
+void ValidateRankMappings(const std::vector<RankMappingRecord>& records,
+                          const RackConfig& rack,
+                          const RankPlan& plan);
 void ValidateCapabilities(MPI_Comm world, const CapabilityInfo& caps);
 void PinThreadToNuma(int numa_id);
 void Barrier(MPI_Comm comm);

@@ -98,8 +98,11 @@ for item in doc["rack"]:
     devices = merged.get("device")
     if not isinstance(host, str):
         raise SystemExit(f"{label}: hostname must be a string")
-    if not isinstance(devices, list):
-        raise SystemExit(f"{label}: device must be a YAML list")
+    if not isinstance(devices, list) or not (1 <= len(devices) <= 4):
+        raise SystemExit(f"{label}: device must be a YAML list with 1 to 4 entries")
+    devices = [int(x) for x in devices]
+    if len(set(devices)) != len(devices) or any(x < 0 for x in devices):
+        raise SystemExit(f"{label}: devices must be unique non-negative integers")
     print(f"{label}\t{host}\t{port}\t{','.join(str(x) for x in devices)}")
 PY
 }
@@ -187,12 +190,12 @@ PY
     idx=$((idx + 1))
   done < <(parse_rack "$rack_yaml")
 
-  [[ "$idx" -eq 2 ]] || die "this v1 sample expects exactly two rack entries"
+  [[ "$idx" -ge 1 && "$idx" -le 18 ]] || die "rack mode expects 1 to 18 rack entries"
 
   cat <<'NOTE'
 == remaining checks ==
-GPU-to-NUMA uniqueness for the selected pairs is checked inside the binary with
-CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID.
+Selected GPU-to-NUMA IDs, CPU affinity, CUDA VMM, fabric-handle, and multicast
+capabilities are checked inside the binary.
 
 Compute-node checks cannot prove NVSwitch partition membership. Ask the fabric
 operator to run `nv show sdn partition`; the default expected state is one

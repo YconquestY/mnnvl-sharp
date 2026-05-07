@@ -1,12 +1,12 @@
 # GB200 NVL72 MNNVL SHARP All-Reduce Sample
 
-This repository contains a standalone CUDA 13.1 + MPI sample,
-`mnnvl_sharp_allreduce`, for two GB200 NVL72 compute trays. It launches four MPI
-ranks, maps one rank to each selected GPU, allocates a fabric-shareable GPU
-buffer per rank, builds unicast and multicast virtual mappings, and uses NVLink
-SHARP through PTX `multimem.ld_reduce` for an FP8 E4M3 all-reduce.
+This repository contains a standalone CUDA 13.1 + MPI sample named
+`mnnvl_sharp_allreduce`. It reads a rack YAML inventory, launches one MPI rank
+per selected GPU, allocates fabric-shareable GPU memory with CUDA Driver API
+VMM, maps symmetric unicast peer slots, creates an NVLink multicast alias, and
+uses NVLink SHARP through PTX `multimem` for an FP8 E4M3 all-reduce.
 
-The v1 datatype policy is explicit:
+The datatype policy is explicit:
 
 - `FP8 E4M3`: supported and executed through the compiled `multimem` kernel path.
 - `NVFP4`: reported unsupported under this CUDA 13.1 raw `multimem` path.
@@ -14,74 +14,78 @@ The v1 datatype policy is explicit:
 
 ## Rack YAML
 
-Use the compute-tray GPU pairs from the task: GPUs `0,2` on tray 0 and GPUs
-`1,3` on tray 1. The binary revalidates that each tray’s selected pair maps to
-two distinct `CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID` values.
+The rack YAML may describe any subset of the rack, from one tray to all 18 trays.
+Each tray entry may list one to four local CUDA device ordinals. YAML order is
+the deterministic input order for rank selection.
 
 ```yaml
 rack:
   - GB200-Rack5-01:
       - hostname: 10.135.1.31
       - port: 4399
-      - device: [0, 2]
+      - device: [0, 1, 2, 3]
   - GB200-Rack5-02:
       - hostname: 10.135.1.32
       - device:
+          - 0
           - 1
+          - 2
           - 3
 ```
 
-The rack key should match `hostname` inside the container. If it does not, launch
-with `MNNVL_HOST_LABEL=<rack-key>` for that process. The helper launcher assumes
-hostnames match the YAML keys.
+`port` defaults to `4399`. The rack key should match `hostname` inside the
+container. If it does not, launch that process with `MNNVL_HOST_LABEL=<rack-key>`.
+The helper launcher assumes the container hostnames match the YAML keys.
 
 ## Build
 
 Required packages/tools:
 
-- CUDA Toolkit 13.1 with a Blackwell GPU code target.
+- CUDA Toolkit 13.1 with a feature-specific Blackwell target such as `sm_100a`.
 - CMake 3.27 or newer.
 - MPI with C++ bindings.
 - `yaml-cpp`.
 - Python 3 and PyYAML for helper scripts.
+- matplotlib for plotting sweep output.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build -j
 ```
 
-The CMake configure step queries `nvcc --list-gpu-code` and fails if no
-Blackwell target is available.
+The CMake configure step queries `nvcc` and fails if a Blackwell target required
+for FP8 `multimem` support is unavailable.
 
 ## Preflight
 
-Run local checks on a selected container:
+Run local checks on one selected container:
 
 ```bash
 scripts/preflight_imex.sh
 ```
 
-Run rack checks across both containers:
+Run rack checks across the YAML-selected containers:
 
 ```bash
 scripts/preflight_imex.sh /absolute/path/to/rack.yaml
 ```
 
-The script checks the IMEX service, `channel0`, `nodes_config.cfg`, GPU
-inventory, and `nvidia-imex-ctl -N`. Compute-node checks cannot prove NVSwitch
-partition compatibility, so an operator must also run this on the fabric side:
+The script checks IMEX channel visibility, `channel0`, normalized
+`nodes_config.cfg`, GPU inventory, and available IMEX health commands. Compute
+node checks cannot prove NVSwitch partition compatibility, so an operator must
+also run this on the fabric side:
 
 ```bash
 nv show sdn partition
 ```
 
 For the default rack-wide setup, expect one healthy `Default Partition` covering
-all 72 GPUs. If user partitions exist, both selected trays must be in the same
+all 72 GPUs. If user partitions exist, all selected trays must be in the same
 partition.
 
 ## Launch
 
-After you provide the YAML file and confirm preflight, launch with:
+Launch the default full YAML inventory:
 
 ```bash
 scripts/run_mnnvl_sharp.sh /absolute/path/to/rack.yaml \
@@ -91,30 +95,54 @@ scripts/run_mnnvl_sharp.sh /absolute/path/to/rack.yaml \
   --reference-check-bytes 16777216
 ```
 
-The launcher derives:
+Launch a selected rank count:
 
-- `mpirun -np 4`
-- YAML-order host list as `<rack-key>:2,<rack-key>:2`
-- `--map-by ppr:2:node`
-- a temporary SSH config using each entry’s `hostname` and `port`
+```bash
+scripts/run_mnnvl_sharp.sh /absolute/path/to/rack.yaml \
+  --rank-count 8 \
+  --rank-selection balanced \
+  --init-only \
+  --json
+```
 
-## What The Binary Checks
+Rank selection policies:
+
+- `balanced`: slot 0 across all trays, then slot 1 across all trays, and so on.
+- `prefix`: trays in YAML order, then devices in each tray's listed order.
+
+The launcher derives `mpirun -np <rank-count>`, per-host slots, a temporary SSH
+config from each entry's `hostname` and `port`, and an Open MPI rankfile so
+global rank order matches the selected rank plan.
+
+## Runtime Checks
 
 At runtime the sample validates:
 
-- exactly four MPI ranks and two ranks per selected container
-- exactly two rack entries and two unique devices per entry
-- selected GPUs on each tray have distinct `HOST_NUMA_ID` values
-- all selected GPUs support CUDA VMM, fabric handles, and multicast
-- all ranks can read canaries from all four fabric-imported unicast slots
+- MPI world size equals the selected rank count.
+- selected ranks map to the expected `(container, GPU)` plan.
+- each selected GPU resolves to a valid `CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID`.
+- each rank is pinned to its GPU-local NUMA CPU node.
+- all selected GPUs support CUDA VMM, fabric handles, and multicast.
+- all ranks can read canaries from all selected fabric-imported unicast slots.
 
-It then initializes the local FP8 E4M3 payload, fences aliasing, runs the rank-0
-NVLink SHARP all-reduce kernel over the multicast alias, and verifies:
+The program reports peer-access initialization latency separately from SHARP
+timing. `--init-only` stops after fabric handle exchange, peer mapping,
+multicast alias setup, and the symmetric-memory smoke test.
 
-- all four replicas have identical full-buffer device hashes
-- rank 0 matches a CPU semantic reference for `E4M3 -> FP16 accumulation -> E4M3`
-- rank 0 reports numeric error against a float32 CPU reference
-- rank 0 reports SHARP kernel timing with CUDA events when measured iterations
-  are requested
+## Sweep
 
-Use `--json` for a single machine-readable summary line.
+Run the initialization-latency sweep:
+
+```bash
+scripts/run_init_sweep.py /absolute/path/to/rack.yaml \
+  --rank-counts 4,8,16,32,64,72 \
+  --repeats 3 \
+  --out-dir results/init_sweep
+```
+
+The sweep runs the launcher with `--init-only --json`, writes
+`results/init_sweep/init_latency.csv`, and writes
+`results/init_sweep/init_latency.png` with global-max peer initialization
+latency versus rank count.
+
+Use `--json` on normal runs for a single machine-readable summary line.

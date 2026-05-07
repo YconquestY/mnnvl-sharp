@@ -1,9 +1,12 @@
 #include "rack_config.h"
 
 #include <algorithm>
+#include <map>
+#include <numeric>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 
 #include <yaml-cpp/yaml.h>
 
@@ -56,6 +59,40 @@ std::string NormalizeHostLabel(const std::string& host) {
   return host.substr(0, pos);
 }
 
+const RankTarget& RankPlan::target(int rank) const {
+  if (rank < 0 || rank >= static_cast<int>(targets_.size())) {
+    throw std::runtime_error("rank index is outside the selected rank plan");
+  }
+  return targets_[static_cast<std::size_t>(rank)];
+}
+
+int RankPlan::SlotCountForHost(const std::string& host_label) const {
+  const std::string normalized = NormalizeHostLabel(host_label);
+  int count = 0;
+  for (const auto& target : targets_) {
+    if (NormalizeHostLabel(target.host_label) == normalized) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+std::map<std::string, int> RankPlan::SlotCountsByHost() const {
+  std::map<std::string, int> counts;
+  for (const auto& target : targets_) {
+    ++counts[NormalizeHostLabel(target.host_label)];
+  }
+  return counts;
+}
+
+std::map<std::string, std::vector<int>> RankPlan::DevicesByHost() const {
+  std::map<std::string, std::vector<int>> devices;
+  for (const auto& target : targets_) {
+    devices[NormalizeHostLabel(target.host_label)].push_back(target.gpu_ordinal);
+  }
+  return devices;
+}
+
 RackConfig RackConfig::Load(const std::string& path) {
   YAML::Node root = YAML::LoadFile(path);
   if (!root["rack"] || !root["rack"].IsSequence()) {
@@ -86,23 +123,31 @@ RackConfig RackConfig::Load(const std::string& path) {
     if (!body["device"] || !body["device"].IsSequence()) {
       throw std::runtime_error("rack entry " + entry.host_label + " requires 'device' as a YAML sequence");
     }
+    std::set<int> devices;
     for (const auto& dev : body["device"]) {
       if (!dev.IsScalar()) {
         throw std::runtime_error("rack entry " + entry.host_label + " device entries must be scalar integers");
       }
-      entry.devices.push_back(dev.as<int>());
+      const int ordinal = dev.as<int>();
+      if (ordinal < 0) {
+        throw std::runtime_error("rack entry " + entry.host_label + " lists a negative CUDA device ordinal");
+      }
+      if (!devices.insert(ordinal).second) {
+        throw std::runtime_error("rack entry " + entry.host_label + " lists duplicate CUDA device ordinals");
+      }
+      entry.devices.push_back(ordinal);
     }
-    if (entry.devices.size() != 2) {
-      throw std::runtime_error("rack entry " + entry.host_label + " must list exactly two CUDA device ordinals");
-    }
-    if (entry.devices[0] == entry.devices[1]) {
-      throw std::runtime_error("rack entry " + entry.host_label + " lists duplicate CUDA device ordinals");
+    if (entry.devices.empty() || entry.devices.size() > 4) {
+      throw std::runtime_error("rack entry " + entry.host_label + " must list 1 to 4 CUDA device ordinals");
     }
     cfg.entries_.push_back(entry);
   }
 
-  if (cfg.entries_.size() != 2) {
-    throw std::runtime_error("this v1 sample requires exactly two rack entries");
+  if (cfg.entries_.empty() || cfg.entries_.size() > 18) {
+    throw std::runtime_error("rack config must contain 1 to 18 rack entries");
+  }
+  if (cfg.AvailableRankCount() > 72) {
+    throw std::runtime_error("rack config describes more than 72 CUDA devices");
   }
   return cfg;
 }
@@ -117,15 +162,65 @@ const RackEntry* RackConfig::FindByHostLabel(const std::string& label) const {
   return nullptr;
 }
 
-std::string RackConfig::MpiHostList() const {
-  std::ostringstream os;
-  for (std::size_t i = 0; i < entries_.size(); ++i) {
-    if (i != 0) {
-      os << ",";
-    }
-    os << entries_[i].host_label << ":2";
+std::size_t RackConfig::AvailableRankCount() const {
+  return std::accumulate(entries_.begin(), entries_.end(), std::size_t{0},
+                         [](std::size_t sum, const RackEntry& entry) {
+                           return sum + entry.devices.size();
+                         });
+}
+
+RankPlan BuildRankPlan(const RackConfig& rack, int rank_count, const std::string& selection) {
+  if (rank_count <= 0) {
+    throw std::runtime_error("rank_count must be positive");
   }
-  return os.str();
+  const std::size_t available = rack.AvailableRankCount();
+  if (static_cast<std::size_t>(rank_count) > available) {
+    throw std::runtime_error("rank_count " + std::to_string(rank_count) +
+                             " exceeds rack.yaml device count " + std::to_string(available));
+  }
+  if (selection != "balanced" && selection != "prefix") {
+    throw std::runtime_error("rank selection must be balanced or prefix");
+  }
+
+  std::vector<RankTarget> targets;
+  targets.reserve(static_cast<std::size_t>(rank_count));
+  auto append = [&](std::size_t rack_index, int gpu_ordinal) {
+    const RackEntry& entry = rack.entries()[rack_index];
+    targets.push_back(RankTarget{
+        .rank_index_in_plan = static_cast<int>(targets.size()),
+        .rack_index = static_cast<int>(rack_index),
+        .host_label = entry.host_label,
+        .control_hostname = entry.control_hostname,
+        .ssh_port = entry.ssh_port,
+        .gpu_ordinal = gpu_ordinal,
+    });
+  };
+
+  if (selection == "prefix") {
+    for (std::size_t rack_index = 0; rack_index < rack.entries().size(); ++rack_index) {
+      for (int gpu : rack.entries()[rack_index].devices) {
+        append(rack_index, gpu);
+        if (static_cast<int>(targets.size()) == rank_count) {
+          return RankPlan(std::move(targets));
+        }
+      }
+    }
+  } else {
+    for (std::size_t device_slot = 0; device_slot < 4; ++device_slot) {
+      for (std::size_t rack_index = 0; rack_index < rack.entries().size(); ++rack_index) {
+        const auto& devices = rack.entries()[rack_index].devices;
+        if (device_slot >= devices.size()) {
+          continue;
+        }
+        append(rack_index, devices[device_slot]);
+        if (static_cast<int>(targets.size()) == rank_count) {
+          return RankPlan(std::move(targets));
+        }
+      }
+    }
+  }
+
+  throw std::runtime_error("failed to build a complete rank plan");
 }
 
 }  // namespace mnnvl

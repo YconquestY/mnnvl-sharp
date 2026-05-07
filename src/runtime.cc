@@ -137,11 +137,15 @@ void CheckCudaRuntime(cudaError_t result, const char* expr) {
   }
 }
 
-RankInfo DiscoverRankInfo(MPI_Comm world, const RackConfig& rack) {
+RankInfo DiscoverRankInfo(MPI_Comm world, const RackConfig& rack, const RankPlan& plan) {
   RankInfo rank;
   rank.rack_count = static_cast<int>(rack.entries().size());
   MPI_Comm_rank(world, &rank.world_rank);
   MPI_Comm_size(world, &rank.world_size);
+  if (rank.world_size != plan.size()) {
+    throw std::runtime_error("MPI world_size " + std::to_string(rank.world_size) +
+                             " does not match selected rank_count " + std::to_string(plan.size()));
+  }
 
   MPI_Comm local_raw = MPI_COMM_NULL;
   MPI_Comm_split_type(world, MPI_COMM_TYPE_SHARED, rank.world_rank, MPI_INFO_NULL, &local_raw);
@@ -157,6 +161,13 @@ RankInfo DiscoverRankInfo(MPI_Comm world, const RackConfig& rack) {
     throw std::runtime_error("hostname '" + rank.os_hostname + "' did not match rack.yaml; set MNNVL_HOST_LABEL to the rack key if the container hostname differs");
   }
 
+  const RankTarget& target = plan.target(rank.world_rank);
+  if (NormalizeHostLabel(entry->host_label) != NormalizeHostLabel(target.host_label)) {
+    throw std::runtime_error("rank " + std::to_string(rank.world_rank) + " is running on host '" +
+                             entry->host_label + "' but the selected rank plan expects '" +
+                             target.host_label + "'");
+  }
+
   for (std::size_t i = 0; i < rack.entries().size(); ++i) {
     if (&rack.entries()[i] == entry) {
       rank.rack_index = static_cast<int>(i);
@@ -167,16 +178,13 @@ RankInfo DiscoverRankInfo(MPI_Comm world, const RackConfig& rack) {
   rank.control_hostname = entry->control_hostname;
   rank.ssh_port = entry->ssh_port;
 
-  if (rank.world_size != 4) {
-    throw std::runtime_error("this v1 sample requires MPI world_size == 4");
+  const int expected_local_size = plan.SlotCountForHost(entry->host_label);
+  if (rank.local_size != expected_local_size) {
+    throw std::runtime_error("host " + entry->host_label + " has MPI local_size " +
+                             std::to_string(rank.local_size) + " but selected rank plan expects " +
+                             std::to_string(expected_local_size));
   }
-  if (rank.local_size != 2) {
-    throw std::runtime_error("this v1 sample requires exactly 2 ranks per selected container");
-  }
-  if (rank.local_rank < 0 || rank.local_rank >= static_cast<int>(entry->devices.size())) {
-    throw std::runtime_error("local rank does not map to a configured device");
-  }
-  rank.gpu_ordinal = entry->devices[rank.local_rank];
+  rank.gpu_ordinal = target.gpu_ordinal;
   return rank;
 }
 
@@ -220,9 +228,11 @@ std::vector<RankMappingRecord> GatherRankMappings(MPI_Comm world, const RankInfo
   return records;
 }
 
-void ValidateRankMappings(const std::vector<RankMappingRecord>& records, const RackConfig& rack) {
-  if (records.size() != 4) {
-    throw std::runtime_error("expected exactly four rank mapping records");
+void ValidateRankMappings(const std::vector<RankMappingRecord>& records,
+                          const RackConfig& rack,
+                          const RankPlan& plan) {
+  if (records.size() != static_cast<std::size_t>(plan.size())) {
+    throw std::runtime_error("rank mapping record count does not match selected rank plan");
   }
   std::set<int> seen_ranks;
   std::map<std::string, std::vector<RankMappingRecord>> by_host;
@@ -231,29 +241,54 @@ void ValidateRankMappings(const std::vector<RankMappingRecord>& records, const R
       throw std::runtime_error("duplicate world rank in mapping records");
     }
     by_host[NormalizeHostLabel(record.host_label)].push_back(record);
+    const RankTarget& target = plan.target(record.world_rank);
+    if (NormalizeHostLabel(record.host_label) != NormalizeHostLabel(target.host_label)) {
+      throw std::runtime_error("rank " + std::to_string(record.world_rank) +
+                               " host does not match selected rank plan");
+    }
+    if (record.rack_index != target.rack_index) {
+      throw std::runtime_error("rank " + std::to_string(record.world_rank) +
+                               " rack index does not match selected rank plan");
+    }
+    if (record.gpu_ordinal != target.gpu_ordinal) {
+      throw std::runtime_error("rank " + std::to_string(record.world_rank) +
+                               " GPU ordinal does not match selected rank plan");
+    }
+    if (record.host_numa_id < 0) {
+      throw std::runtime_error("rank " + std::to_string(record.world_rank) +
+                               " did not resolve a valid HOST_NUMA_ID");
+    }
   }
   for (const auto& entry : rack.entries()) {
     const std::string host = NormalizeHostLabel(entry.host_label);
+    const int expected_slots = plan.SlotCountForHost(entry.host_label);
     auto it = by_host.find(host);
-    if (it == by_host.end() || it->second.size() != 2) {
-      throw std::runtime_error("rack entry " + entry.host_label + " must have exactly two MPI ranks");
+    if (expected_slots == 0) {
+      if (it != by_host.end()) {
+        throw std::runtime_error("rack entry " + entry.host_label +
+                                 " has MPI ranks but is not in the selected plan");
+      }
+      continue;
     }
-    std::set<int> local_ranks;
+    if (it == by_host.end() || it->second.size() != static_cast<std::size_t>(expected_slots)) {
+      throw std::runtime_error("rack entry " + entry.host_label + " has " +
+                               std::to_string(it == by_host.end() ? 0 : it->second.size()) +
+                               " MPI ranks but selected rank plan expects " +
+                               std::to_string(expected_slots));
+    }
     std::set<int> gpus;
-    std::set<int> numa_ids;
     for (const auto& record : it->second) {
-      local_ranks.insert(record.local_rank);
       gpus.insert(record.gpu_ordinal);
-      numa_ids.insert(record.host_numa_id);
     }
-    if (local_ranks != std::set<int>({0, 1})) {
-      throw std::runtime_error("rack entry " + entry.host_label + " must have local ranks 0 and 1");
+    std::set<int> expected_gpus;
+    for (const auto& target : plan.targets()) {
+      if (NormalizeHostLabel(target.host_label) == host) {
+        expected_gpus.insert(target.gpu_ordinal);
+      }
     }
-    if (gpus != std::set<int>(entry.devices.begin(), entry.devices.end())) {
-      throw std::runtime_error("rack entry " + entry.host_label + " MPI ranks did not map to configured GPUs");
-    }
-    if (numa_ids.size() != 2 || numa_ids.count(-1) != 0) {
-      throw std::runtime_error("selected GPUs on rack entry " + entry.host_label + " do not resolve to two distinct HOST_NUMA_ID values");
+    if (gpus != expected_gpus) {
+      throw std::runtime_error("rack entry " + entry.host_label +
+                               " MPI ranks did not map to selected GPUs");
     }
   }
 }

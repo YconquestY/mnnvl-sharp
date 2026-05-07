@@ -135,10 +135,10 @@ void RunCanarySmokeTest(MPI_Comm world,
   MPI_Barrier(world);
 }
 
-std::array<uint64_t, 4> GatherHashes(MPI_Comm world,
-                                     const RankInfo& rank,
-                                     const FabricAllocation& allocation,
-                                     cudaStream_t stream) {
+std::vector<uint64_t> GatherHashes(MPI_Comm world,
+                                   const RankInfo& rank,
+                                   const FabricAllocation& allocation,
+                                   cudaStream_t stream) {
   uint64_t* d_hash = nullptr;
   MNNVL_CHECK_CUDA(cudaMalloc(reinterpret_cast<void**>(&d_hash), sizeof(uint64_t)));
   uint64_t local_hash = 0;
@@ -148,12 +148,15 @@ std::array<uint64_t, 4> GatherHashes(MPI_Comm world,
   MNNVL_CHECK_CUDA(cudaStreamSynchronize(stream));
   MNNVL_CHECK_CUDA(cudaFree(d_hash));
 
-  std::array<uint64_t, 4> hashes{};
+  std::vector<uint64_t> hashes(static_cast<std::size_t>(rank.world_size));
   MPI_Allgather(&local_hash, 1, MPI_UINT64_T, hashes.data(), 1, MPI_UINT64_T, world);
   return hashes;
 }
 
-bool HashesMatch(const std::array<uint64_t, 4>& hashes) {
+bool HashesMatch(const std::vector<uint64_t>& hashes) {
+  if (hashes.empty()) {
+    return true;
+  }
   return std::all_of(hashes.begin(), hashes.end(), [&](uint64_t value) { return value == hashes[0]; });
 }
 
@@ -173,11 +176,15 @@ void PrintHumanReport(const Config& cfg,
                       const CapabilityInfo& caps,
                       const std::vector<RankMappingRecord>& records,
                       const FabricAllocation& allocation,
-                      const std::array<uint64_t, 4>& hashes,
-                      const PrecisionMetrics& metrics,
+                      const std::vector<uint64_t>* hashes,
+                      const PrecisionMetrics* metrics,
+                      const TimingStats& peer_init,
                       const TimingStats& device,
                       const TimingStats& wall) {
   std::cout << "mnnvl_sharp_allreduce\n";
+  std::cout << "  selected_rank_count: " << records.size() << "\n";
+  std::cout << "  rank_selection: " << cfg.rank_selection << "\n";
+  std::cout << "  init_only: " << (cfg.init_only ? "true" : "false") << "\n";
   std::cout << "  payload_bytes: " << cfg.bytes << "\n";
   std::cout << "  allocation_bytes: " << allocation.alloc_bytes << "\n";
   std::cout << "  vmm_granularity: " << allocation.vmm_granularity << "\n";
@@ -194,26 +201,33 @@ void PrintHumanReport(const Config& cfg,
   std::cout << "  capabilities: vmm=" << caps.vmm_supported
             << " fabric_handle=" << caps.fabric_handle_supported
             << " multicast=" << caps.multicast_supported << "\n";
+  std::cout << std::fixed << std::setprecision(3);
+  std::cout << "  peer_init_ms: min=" << peer_init.min << " median=" << peer_init.median
+            << " p95=" << peer_init.p95 << " max=" << peer_init.max << "\n";
   std::cout << "  smoke_test: passed\n";
+  if (cfg.init_only) {
+    std::cout << "  sharp_allreduce: skipped\n";
+    return;
+  }
   std::cout << "  replica_hashes:";
-  for (uint64_t h : hashes) {
+  for (uint64_t h : *hashes) {
     std::cout << " 0x" << std::hex << h << std::dec;
   }
   std::cout << "\n";
-  std::cout << "  hashes_match: " << (HashesMatch(hashes) ? "true" : "false") << "\n";
-  std::cout << "  semantic_exact_mismatches: " << metrics.exact_mismatches << "\n";
-  std::cout << "  f32_requantized_mismatches: " << metrics.requantized_mismatches << "\n";
+  std::cout << "  hashes_match: " << (HashesMatch(*hashes) ? "true" : "false") << "\n";
+  std::cout << "  semantic_exact_mismatches: " << metrics->exact_mismatches << "\n";
+  std::cout << "  f32_requantized_mismatches: " << metrics->requantized_mismatches << "\n";
   std::cout << "  f32_max_requantized_ulp_distance: "
-            << metrics.max_requantized_ulp_distance << "\n";
-  std::cout << "  f32_max_abs_error: " << metrics.max_abs_error << "\n";
-  std::cout << "  f32_mean_abs_error: " << metrics.mean_abs_error << "\n";
-  std::cout << std::fixed << std::setprecision(3);
+            << metrics->max_requantized_ulp_distance << "\n";
+  std::cout << "  f32_max_abs_error: " << metrics->max_abs_error << "\n";
+  std::cout << "  f32_mean_abs_error: " << metrics->mean_abs_error << "\n";
   std::cout << "  sharp_kernel_ms: min=" << device.min << " median=" << device.median
             << " p95=" << device.p95 << " max=" << device.max << "\n";
   std::cout << "  collective_wall_ms: min=" << wall.min << " median=" << wall.median
             << " p95=" << wall.p95 << " max=" << wall.max << "\n";
   if (rank.world_rank == 0 && device.median > 0.0) {
-    const double logical_gib = (4.0 * static_cast<double>(cfg.bytes)) / (1024.0 * 1024.0 * 1024.0);
+    const double logical_gib = (static_cast<double>(records.size()) * static_cast<double>(cfg.bytes)) /
+                               (1024.0 * 1024.0 * 1024.0);
     const double bandwidth = logical_gib / (device.median / 1000.0);
     std::cout << "  effective_logical_bandwidth_gib_s_median: " << bandwidth << "\n";
   }
@@ -223,32 +237,58 @@ void PrintJsonReport(const Config& cfg,
                      const CapabilityInfo& caps,
                      const std::vector<RankMappingRecord>& records,
                      const FabricAllocation& allocation,
-                     const std::array<uint64_t, 4>& hashes,
-                     const PrecisionMetrics& metrics,
+                     const std::vector<uint64_t>* hashes,
+                     const PrecisionMetrics* metrics,
+                     const TimingStats& peer_init,
                      const TimingStats& device,
                      const TimingStats& wall) {
   std::ostringstream os;
   os << "{";
-  os << "\"payload_bytes\":" << cfg.bytes;
+  os << "\"selected_rank_count\":" << records.size();
+  os << ",\"rank_selection\":\"" << JsonEscape(cfg.rank_selection) << "\"";
+  os << ",\"init_only\":" << (cfg.init_only ? "true" : "false");
+  os << ",\"payload_bytes\":" << cfg.bytes;
   os << ",\"allocation_bytes\":" << allocation.alloc_bytes;
   os << ",\"datatype_support\":{\"e4m3\":\""
      << (caps.sharp_e4m3_supported ? "supported" : "unsupported")
      << "\",\"nvfp4\":\"unsupported\",\"mxfp4\":\"unsupported\"}";
   os << ",\"host_mapping\":" << HostMappingJson(records);
-  os << ",\"hashes_match\":" << (HashesMatch(hashes) ? "true" : "false");
-  os << ",\"hashes\":[";
-  for (std::size_t i = 0; i < hashes.size(); ++i) {
+  os << ",\"peer_init_ms\":" << peer_init.max;
+  os << ",\"peer_init_min_ms\":" << peer_init.min;
+  os << ",\"peer_init_median_ms\":" << peer_init.median;
+  os << ",\"peer_init_p95_ms\":" << peer_init.p95;
+  os << ",\"peer_init_max_ms\":" << peer_init.max;
+  os << ",\"peer_init_local_ms_by_rank\":[";
+  for (std::size_t i = 0; i < allocation.peer_init_all_ms.size(); ++i) {
     if (i != 0) {
       os << ",";
     }
-    os << "\"" << std::hex << hashes[i] << std::dec << "\"";
+    os << allocation.peer_init_all_ms[i];
   }
   os << "]";
-  os << ",\"semantic_exact_mismatches\":" << metrics.exact_mismatches;
-  os << ",\"f32_requantized_mismatches\":" << metrics.requantized_mismatches;
-  os << ",\"f32_max_requantized_ulp_distance\":" << metrics.max_requantized_ulp_distance;
-  os << ",\"f32_max_abs_error\":" << metrics.max_abs_error;
-  os << ",\"f32_mean_abs_error\":" << metrics.mean_abs_error;
+  if (cfg.init_only) {
+    os << ",\"hashes_match\":null,\"hashes\":[]";
+    os << ",\"semantic_exact_mismatches\":null";
+    os << ",\"f32_requantized_mismatches\":null";
+    os << ",\"f32_max_requantized_ulp_distance\":null";
+    os << ",\"f32_max_abs_error\":null";
+    os << ",\"f32_mean_abs_error\":null";
+  } else {
+    os << ",\"hashes_match\":" << (HashesMatch(*hashes) ? "true" : "false");
+    os << ",\"hashes\":[";
+    for (std::size_t i = 0; i < hashes->size(); ++i) {
+      if (i != 0) {
+        os << ",";
+      }
+      os << "\"" << std::hex << (*hashes)[i] << std::dec << "\"";
+    }
+    os << "]";
+    os << ",\"semantic_exact_mismatches\":" << metrics->exact_mismatches;
+    os << ",\"f32_requantized_mismatches\":" << metrics->requantized_mismatches;
+    os << ",\"f32_max_requantized_ulp_distance\":" << metrics->max_requantized_ulp_distance;
+    os << ",\"f32_max_abs_error\":" << metrics->max_abs_error;
+    os << ",\"f32_mean_abs_error\":" << metrics->mean_abs_error;
+  }
   os << ",\"sharp_kernel_ms\":{\"min\":" << device.min << ",\"median\":" << device.median
      << ",\"p95\":" << device.p95 << ",\"max\":" << device.max << "}";
   os << ",\"collective_wall_ms\":{\"min\":" << wall.min << ",\"median\":" << wall.median
@@ -274,11 +314,15 @@ void MaybeDumpMismatches(const std::vector<uint32_t>& result_words, int ranks, c
 int Run(int argc, char** argv) {
   Config cfg = ParseConfig(argc, argv);
   RackConfig rack = RackConfig::Load(cfg.rack_config_path);
-  RankInfo rank = DiscoverRankInfo(MPI_COMM_WORLD, rack);
+  int world_size = 0;
+  MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+  const int selected_rank_count = cfg.rank_count.value_or(world_size);
+  RankPlan plan = BuildRankPlan(rack, selected_rank_count, cfg.rank_selection);
+  RankInfo rank = DiscoverRankInfo(MPI_COMM_WORLD, rack, plan);
   CapabilityInfo caps = InitializeCudaAndQuery(&rank);
   PinThreadToNuma(rank.host_numa_id);
   const std::vector<RankMappingRecord> records = GatherRankMappings(MPI_COMM_WORLD, rank);
-  ValidateRankMappings(records, rack);
+  ValidateRankMappings(records, rack, plan);
   ValidateCapabilities(MPI_COMM_WORLD, caps);
 
   cudaStream_t stream = nullptr;
@@ -290,6 +334,24 @@ int Run(int argc, char** argv) {
 
   FabricAllocation allocation = CreateFabricAllocation(MPI_COMM_WORLD, rank, cfg.bytes);
   RunCanarySmokeTest(MPI_COMM_WORLD, rank, allocation, stream);
+  const TimingStats peer_init = Summarize(allocation.peer_init_all_ms);
+
+  if (cfg.init_only) {
+    if (rank.world_rank == 0) {
+      const TimingStats empty{};
+      if (cfg.json) {
+        PrintJsonReport(cfg, caps, records, allocation, nullptr, nullptr, peer_init, empty, empty);
+      } else {
+        PrintHumanReport(cfg, rank, caps, records, allocation, nullptr, nullptr, peer_init, empty, empty);
+      }
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    DestroyFabricAllocation(rank, &allocation);
+    cudaEventDestroy(stop);
+    cudaEventDestroy(start);
+    cudaStreamDestroy(stream);
+    return 0;
+  }
 
   for (int i = 0; i < cfg.warmup; ++i) {
     RunAllReduceIteration(MPI_COMM_WORLD, rank, allocation, stream, start, stop, false, nullptr, nullptr);
@@ -310,7 +372,7 @@ int Run(int argc, char** argv) {
     RunAllReduceIteration(MPI_COMM_WORLD, rank, allocation, stream, start, stop, false, nullptr, nullptr);
   }
 
-  const std::array<uint64_t, 4> hashes = GatherHashes(MPI_COMM_WORLD, rank, allocation, stream);
+  const std::vector<uint64_t> hashes = GatherHashes(MPI_COMM_WORLD, rank, allocation, stream);
   std::vector<uint32_t> checked_words;
   CopyReferenceRegion(rank, allocation, cfg.reference_check_bytes, &checked_words);
 
@@ -321,11 +383,11 @@ int Run(int argc, char** argv) {
     const TimingStats device = Summarize(device_times);
     const TimingStats wall = Summarize(wall_times);
     if (cfg.json) {
-      PrintJsonReport(cfg, caps, records, allocation, hashes, metrics, device, wall);
+      PrintJsonReport(cfg, caps, records, allocation, &hashes, &metrics, peer_init, device, wall);
     } else {
-      PrintHumanReport(cfg, rank, caps, records, allocation, hashes, metrics, device, wall);
+      PrintHumanReport(cfg, rank, caps, records, allocation, &hashes, &metrics, peer_init, device, wall);
     }
-    if (!HashesMatch(hashes) || metrics.max_requantized_ulp_distance > 1) {
+    if (!HashesMatch(hashes) || metrics.exact_mismatches != 0) {
       final_status = 2;
     }
   }

@@ -49,9 +49,10 @@ std::string NeedValue(int& i, int argc, char** argv, const std::string& flag) {
 std::string Usage(const char* argv0) {
   std::ostringstream os;
   os << "usage: " << argv0
-     << " --rack-config rack.yaml [--bytes 1073741824] [--warmup 3]"
-     << " [--iters 20] [--types auto|e4m3]"
-     << " [--reference-check-bytes 16777216] [--json]\n";
+     << " --rack-config rack.yaml [--rank-count N]"
+     << " [--rank-selection balanced|prefix] [--bytes 1073741824]"
+     << " [--warmup 3] [--iters 20] [--types auto|e4m3]"
+     << " [--reference-check-bytes 16777216] [--init-only] [--json]\n";
   return os.str();
 }
 
@@ -61,6 +62,10 @@ Config ParseConfig(int argc, char** argv) {
     const std::string arg = argv[i];
     if (arg == "--rack-config") {
       cfg.rack_config_path = NeedValue(i, argc, argv, arg);
+    } else if (arg == "--rank-count") {
+      cfg.rank_count = ParseInt(NeedValue(i, argc, argv, arg), arg);
+    } else if (arg == "--rank-selection") {
+      cfg.rank_selection = NeedValue(i, argc, argv, arg);
     } else if (arg == "--bytes") {
       cfg.bytes = ParseSize(NeedValue(i, argc, argv, arg), arg);
     } else if (arg == "--warmup") {
@@ -71,6 +76,8 @@ Config ParseConfig(int argc, char** argv) {
       cfg.types = NeedValue(i, argc, argv, arg);
     } else if (arg == "--reference-check-bytes") {
       cfg.reference_check_bytes = ParseSize(NeedValue(i, argc, argv, arg), arg);
+    } else if (arg == "--init-only") {
+      cfg.init_only = true;
     } else if (arg == "--json") {
       cfg.json = true;
     } else if (arg == "--help" || arg == "-h") {
@@ -85,6 +92,12 @@ Config ParseConfig(int argc, char** argv) {
   }
   if (cfg.bytes == 0 || (cfg.bytes % 4) != 0) {
     throw std::invalid_argument("--bytes must be nonzero and a multiple of 4");
+  }
+  if (cfg.rank_count && *cfg.rank_count <= 0) {
+    throw std::invalid_argument("--rank-count must be >= 1");
+  }
+  if (cfg.rank_selection != "balanced" && cfg.rank_selection != "prefix") {
+    throw std::invalid_argument("--rank-selection must be balanced or prefix");
   }
   if (cfg.reference_check_bytes == 0 || (cfg.reference_check_bytes % 4) != 0) {
     throw std::invalid_argument("--reference-check-bytes must be nonzero and a multiple of 4");

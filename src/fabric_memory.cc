@@ -1,7 +1,6 @@
 #include "fabric_memory.h"
 
 #include <algorithm>
-#include <array>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -21,9 +20,9 @@ CUmemAllocationProp DeviceFabricAllocationProp(const RankInfo& rank) {
   return prop;
 }
 
-CUmulticastObjectProp MulticastProp(std::size_t size) {
+CUmulticastObjectProp MulticastProp(std::size_t size, int num_devices) {
   CUmulticastObjectProp prop{};
-  prop.numDevices = 4;
+  prop.numDevices = static_cast<unsigned int>(num_devices);
   prop.size = size;
   prop.handleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
   prop.flags = 0;
@@ -73,12 +72,17 @@ std::size_t AlignUp(std::size_t value, std::size_t alignment) {
 FabricAllocation CreateFabricAllocation(MPI_Comm world, const RankInfo& rank, std::size_t payload_bytes) {
   FabricAllocation allocation;
   allocation.payload_bytes = payload_bytes;
+  int world_size = 0;
+  MPI_Comm_size(world, &world_size);
+  if (world_size <= 0) {
+    throw std::runtime_error("fabric allocation requires a positive MPI world size");
+  }
 
   const CUmemAllocationProp alloc_prop = DeviceFabricAllocationProp(rank);
   MNNVL_CHECK_CU(cuMemGetAllocationGranularity(&allocation.vmm_granularity, &alloc_prop,
                                                CU_MEM_ALLOC_GRANULARITY_MINIMUM));
 
-  CUmulticastObjectProp mc_probe = MulticastProp(payload_bytes);
+  CUmulticastObjectProp mc_probe = MulticastProp(payload_bytes, world_size);
   MNNVL_CHECK_CU(cuMulticastGetGranularity(&allocation.multicast_granularity, &mc_probe,
                                            CU_MULTICAST_GRANULARITY_MINIMUM));
 
@@ -87,14 +91,11 @@ FabricAllocation CreateFabricAllocation(MPI_Comm world, const RankInfo& rank, st
 
   MNNVL_CHECK_CU(cuMemCreate(&allocation.local_handle, allocation.alloc_bytes, &alloc_prop, 0));
 
+  MPI_Barrier(world);
+  const double peer_init_t0 = MPI_Wtime();
+
   CUmemFabricHandle local_fabric{};
   ExportFabric(allocation.local_handle, &local_fabric);
-
-  int world_size = 0;
-  MPI_Comm_size(world, &world_size);
-  if (world_size != 4) {
-    throw std::runtime_error("fabric allocation requires exactly four ranks");
-  }
 
   std::vector<CUmemFabricHandle> fabric_handles(static_cast<std::size_t>(world_size));
   MPI_Allgather(local_fabric.data, CU_IPC_HANDLE_SIZE, MPI_BYTE,
@@ -112,13 +113,18 @@ FabricAllocation CreateFabricAllocation(MPI_Comm world, const RankInfo& rank, st
   const CUmemAccessDesc access = DeviceAccessDesc(rank);
   const std::size_t uc_size = allocation.alloc_bytes * static_cast<std::size_t>(world_size);
   MNNVL_CHECK_CU(cuMemAddressReserve(&allocation.uc_base, uc_size, granularity, 0, 0));
+  allocation.uc_slots.resize(static_cast<std::size_t>(world_size), 0);
   for (int r = 0; r < world_size; ++r) {
     const CUdeviceptr slot = allocation.uc_base + static_cast<CUdeviceptr>(r * allocation.alloc_bytes);
     MapAllocation(slot, allocation.alloc_bytes, allocation.imported_handles[r], access);
     allocation.uc_slots[static_cast<std::size_t>(r)] = slot;
   }
+  allocation.peer_init_local_ms = (MPI_Wtime() - peer_init_t0) * 1000.0;
+  allocation.peer_init_all_ms.resize(static_cast<std::size_t>(world_size), 0.0);
+  MPI_Allgather(&allocation.peer_init_local_ms, 1, MPI_DOUBLE,
+                allocation.peer_init_all_ms.data(), 1, MPI_DOUBLE, world);
 
-  CUmulticastObjectProp mc_prop = MulticastProp(allocation.alloc_bytes);
+  CUmulticastObjectProp mc_prop = MulticastProp(allocation.alloc_bytes, world_size);
   CUmemFabricHandle mc_fabric{};
   if (rank.world_rank == 0) {
     MNNVL_CHECK_CU(cuMulticastCreate(&allocation.multicast_handle, &mc_prop));
