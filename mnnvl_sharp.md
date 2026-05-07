@@ -2,25 +2,46 @@
 
 ## Summary
 - Build a standalone sample named `mnnvl_sharp_allreduce`.
-- Use `MPI + CUDA Driver API` with one rank per selected GPU: 4 ranks total across 2 trays.
-- Fix the default GPU placement to the requested layout: tray 0 uses `{0,2}` and tray 1 uses `{1,3}`.
+- Use CUDA Toolkit 13.1, `MPI + CUDA Driver API`, and one rank per selected GPU: 4 ranks total across 2 trays.
+- Read rack placement from a YAML config instead of hard-coding tray GPU flags.
 - Use raw CUDA virtual memory management, IMEX fabric handles, multicast objects, and `multimem` PTX so the sample explicitly exercises MNNVL symmetric memory and NVLink SHARP.
-- Execute the SHARP path only for `FP8 E4M3`; report `NVFP4` and `MXFP4` unsupported under the chosen CUDA 13.0 programming path.
+- Execute the SHARP path only for `FP8 E4M3`; report `NVFP4` and `MXFP4` unsupported under the chosen CUDA 13.1 programming path.
 - Assume the rack remains on the default 72-GPU NVLink partition and that the selected trays are members of the same healthy IMEX domain. In the single-user setup, `channel0` on each selected node is sufficient.
 
 ## Key Changes
 - Public interface:
-  - `--tray0-gpus 0,2`
-  - `--tray1-gpus 1,3`
+  - `--rack-config rack.yaml`
   - `--bytes 1073741824`
   - `--warmup 3`
   - `--iters 20`
   - `--types auto|e4m3`
-  - `--cpu-ref-sample-bytes 16777216`
+  - `--reference-check-bytes 16777216`
   - `--json`
+- Rack YAML schema:
+  ```yaml
+  rack:
+    - GB200-Rack5-01:
+        - hostname: 10.135.1.31
+        - port: 4399
+        - device: [0, 2]
+    - GB200-Rack5-02:
+        - hostname: 10.135.1.32
+        - device:
+            - 1
+            - 3
+  ```
+- Rack YAML semantics:
+  - the map key, such as `GB200-Rack5-01`, is the expected compute-tray hostname label
+  - `hostname` is the SSH/control-plane address used to reach the CUDA container
+  - `port` is the SSH port for the CUDA container and defaults to `4399` if omitted
+  - `device` is the ordered YAML list of local CUDA device indices to use in that container
+  - `device` may be written inline as `[0, 2]` or as a block list
+  - the YAML order defines tray order and MPI host order
+  - the CUDA container is assumed to be privileged and started with host networking and IPC, such as `--net=host --ipc=host`
+  - `--rack-config` should point to a YAML file readable at the same path inside every selected container
 - Launch and topology:
-  - Run with `mpirun -np 4 --map-by ppr:2:node`; hostfile order defines tray 0 then tray 1.
-  - Map local rank `0` and `1` to the two configured local GPUs on each tray.
+  - Run with `mpirun -np 4 --map-by ppr:2:node`; launch SSH targets and ports are derived from `rack.yaml`.
+  - Map local rank `0` and `1` to the two configured local GPUs from that container's YAML entry.
   - Query `CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID` for the selected GPUs and fail if the two GPUs on a tray resolve to the same NUMA CPU.
   - Pin each rank to the NUMA CPU nearest its GPU.
 - Preflight model:
@@ -61,6 +82,7 @@
   - `scripts/run_mnnvl_sharp.sh`
   - `src/main.cc`
   - `src/config.*`
+  - `src/rack_config.*`
   - `src/runtime.*`
   - `src/fabric_memory.*`
   - `src/sharp_kernels.cu`
@@ -74,8 +96,8 @@
   - operator confirms the trays are in the same NVLink partition, with the default expected case being one 72-GPU partition
   - all four GPUs pass VMM, fabric-handle, and multicast capability checks
 - Topology test:
-  - tray 0 GPUs `{0,2}` must have different `HOST_NUMA_ID`s
-  - tray 1 GPUs `{1,3}` must have different `HOST_NUMA_ID`s
+  - each YAML host entry must list exactly two unique CUDA device indices
+  - the two selected GPUs on each tray must have different `HOST_NUMA_ID`s
 - Symmetric-memory smoke test:
   - write per-rank canaries into `uc_slots[self]`
   - read back peer canaries from every imported remote slot
@@ -96,16 +118,16 @@
 ## Assumptions
 - Raw CUDA is the chosen path; NCCL is not used for the collective.
 - MPI is used only for process launch, control-plane handle exchange, and barriers; CUDA-aware MPI is not required.
-- Hostfile order defines which node is tray 0 vs tray 1.
+- Rack YAML order defines tray order and MPI host order.
 - The default rack configuration is one healthy 72-GPU NVLink partition.
 - A rack-wide IMEX domain is acceptable even if the job uses only 2 trays, as long as the selected trays are healthy members of that same domain.
-- The only SHARP-relevant datatype from the candidate list on CUDA 13.0 GB200 is `FP8 E4M3`; `NVFP4` and `MXFP4` are not directly exposed by CUDA 13.0 `multimem` reductions.
+- The only SHARP-relevant datatype from the candidate list on CUDA 13.1 GB200 is `FP8 E4M3`; `NVFP4` and `MXFP4` are not directly exposed by CUDA 13.1 `multimem` reductions.
 - Primary references:
   - [IMEX overview](https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/overview.html)
   - [IMEX getting started](https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/gettingstarted.html)
   - [IMEX channels](https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/imexchannels.html)
   - [IMEX deployment](https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/deployment.html)
-  - [CUDA 13.0 programming guide](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-c-programming-guide/index.html)
-  - [CUDA 13.0 driver API](https://docs.nvidia.com/cuda/archive/13.0.0/pdf/CUDA_Driver_API.pdf)
-  - [PTX 13.0.1 multimem support](https://docs.nvidia.com/cuda/archive/13.0.1/hopper-tuning-guide/parallel-thread-execution/index.html)
+  - [CUDA 13.1 programming guide](https://docs.nvidia.com/cuda/archive/13.1.0/cuda-programming-guide/index.html)
+  - [CUDA 13.1 driver API](https://docs.nvidia.com/cuda/archive/13.1.0/cuda-driver-api/index.html)
+  - [PTX multimem support](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html)
   - [NVIDIA multi-gpu-programming-models](https://github.com/NVIDIA/multi-gpu-programming-models)

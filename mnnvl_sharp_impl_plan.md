@@ -1,10 +1,11 @@
 # Concrete Implementation Plan for `mnnvl_sharp_allreduce`
 
 ## Summary
-- Implement a standalone CUDA 13.0 + MPI sample named `mnnvl_sharp_allreduce`.
+- Implement a standalone CUDA 13.1 + MPI sample named `mnnvl_sharp_allreduce`.
 - The sample will run on 2 GB200 NVL72 compute trays with 2 MPI ranks per tray and 1 GPU per rank.
+- The selected CUDA containers, SSH/control-plane addresses, SSH ports, and local CUDA device indices will come from a rack YAML file.
 - The implementation will use CUDA Driver API virtual memory management, IMEX fabric handles, multicast objects, and inline PTX `multimem` instructions for the SHARP path.
-- The sample will only execute the SHARP all-reduce for `FP8 E4M3`. It will detect and report `NVFP4` and `MXFP4` as unsupported under the chosen CUDA 13.0 programming path.
+- The sample will only execute the SHARP all-reduce for `FP8 E4M3`. It will detect and report `NVFP4` and `MXFP4` as unsupported under the chosen CUDA 13.1 programming path.
 - The sample will produce correctness, precision, and timing output in a single run.
 - The implementation assumes the rack remains on the default 72-GPU NVLink partition and that the selected trays are members of the same IMEX domain.
 
@@ -16,6 +17,8 @@
 - `src/main.cc`
 - `src/config.h`
 - `src/config.cc`
+- `src/rack_config.h`
+- `src/rack_config.cc`
 - `src/runtime.h`
 - `src/runtime.cc`
 - `src/fabric_memory.h`
@@ -29,8 +32,10 @@
   - Own process startup, MPI setup, top-level orchestration, and final reporting.
 - `src/config.*`
   - Parse CLI arguments and validate invariant combinations.
+- `src/rack_config.*`
+  - Parse and validate rack YAML, normalize host labels, container SSH addresses, SSH ports, and device lists.
 - `src/runtime.*`
-  - Own topology discovery, tray/rank mapping, NUMA validation, CPU affinity, CUDA device selection, capability checks, MPI handle exchange, and result aggregation.
+  - Own topology discovery, rack-entry/rank mapping, NUMA validation, CPU affinity, CUDA device selection, capability checks, MPI handle exchange, and result aggregation.
 - `src/fabric_memory.*`
   - Own all CUDA Driver API VMM work: local allocation, fabric-handle export/import, symmetric unicast mapping, multicast object creation/import, binding, access setup, and teardown.
 - `src/sharp_kernels.cu`
@@ -46,13 +51,18 @@
 - Use CMake with a single executable target `mnnvl_sharp_allreduce`.
 - Require:
   - CMake `>= 3.27`
-  - CUDA Toolkit `13.0`
+  - CUDA Toolkit `13.1`
   - MPI with C++ bindings available through `find_package(MPI REQUIRED)`
+  - `yaml-cpp` available through `find_package(yaml-cpp REQUIRED)`
   - Linux only
+- Helper-script requirements:
+  - Python 3
+  - PyYAML for extracting MPI host order from `rack.yaml`
 - Link against:
   - `CUDA::cudart`
   - `CUDA::cuda_driver`
   - `MPI::MPI_CXX`
+  - `yaml-cpp`
   - `pthread`
 - Configure the CUDA target as follows:
   - Build the `.cu` translation unit with relocatable device code disabled.
@@ -63,25 +73,56 @@
 
 ## CLI and Runtime Contract
 - CLI:
-  - `--tray0-gpus 0,2`
-  - `--tray1-gpus 1,3`
+  - `--rack-config rack.yaml`
   - `--bytes 1073741824`
   - `--warmup 3`
   - `--iters 20`
   - `--types auto|e4m3`
-  - `--cpu-ref-sample-bytes <N>` with default `16777216`
+  - `--reference-check-bytes <N>` with default `16777216`
   - `--json` to emit one machine-readable summary line
+- Rack YAML schema:
+  ```yaml
+  rack:
+    - GB200-Rack5-01:
+        - hostname: 10.135.1.31
+        - port: 4399
+        - device: [0, 2]
+    - GB200-Rack5-02:
+        - hostname: 10.135.1.32
+        - device:
+            - 1
+            - 3
+  ```
+- Rack YAML compatibility:
+  - Canonical form is the sequence-of-single-key-maps form shown above.
+  - `port` is optional and defaults to `4399`.
+  - `device` must be a YAML sequence and may be written inline as `[0, 2]` or as a block list.
+  - The parser will reject scalar or comma-separated string device values such as `"0,2"`.
+- Rack YAML semantics:
+  - The key under each `rack` item is the compute-tray host label and should match `hostname` output on that tray.
+  - `hostname` is the SSH/control-plane address used to reach the CUDA container.
+  - `port` is the SSH port for the CUDA container.
+  - `device` is an ordered list of local CUDA device indices to use inside that container.
+  - YAML order defines rack-entry order, tray order, and MPI host order.
+  - The CUDA container is assumed to be privileged and started with host networking and IPC, such as `--net=host --ipc=host`, so CUDA, NIC, memory, IMEX, and NVLink resources match the host machine.
+  - `--rack-config` should be passed as an absolute path that is readable at the same path inside every selected container; `scripts/run_mnnvl_sharp.sh` will resolve it with `realpath` and check readability over SSH before launch.
+- Flag semantics:
+  - `--reference-check-bytes` is the number of leading payload bytes compared against CPU references for exactness and precision metrics.
+  - Set `--reference-check-bytes` equal to `--bytes` for a full-buffer CPU reference.
 - Invariants:
   - `world_size == 4`
-  - exactly `2` ranks per host
-  - exactly `2` unique hosts
-  - each tray GPU list contains exactly `2` unique local device ordinals
+  - exactly `2` ranks per selected container
+  - exactly `2` unique rack entries
+  - `rack.yaml` contains exactly `2` rack entries for this v1 sample
+  - each rack entry contains exactly `2` unique local CUDA device ordinals
   - `bytes` is a multiple of `4` because the implementation uses packed `e4m3x4`
-- Host/tray mapping:
+- Rack-entry/rank mapping:
   - Determine local rank with `MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, ...)`.
-  - Gather hostnames across `MPI_COMM_WORLD`.
-  - Rank 0 derives tray order from first appearance in global-rank order. This matches the hostfile ordering assumption.
-  - Local rank `0` maps to the first GPU in the tray list. Local rank `1` maps to the second GPU in the tray list.
+  - Gather container OS hostnames across `MPI_COMM_WORLD`.
+  - Match the local OS hostname to a rack YAML key after normalizing short hostname vs FQDN.
+  - If the OS hostname cannot be matched, allow `MNNVL_HOST_LABEL` to override the host label for that process.
+  - Local rank `0` maps to the first device in the matched rack entry. Local rank `1` maps to the second device in the matched rack entry.
+  - The launcher must start containers in YAML order so global rank order remains deterministic.
 - CPU affinity:
   - Query `CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID` for the selected GPU.
   - Read `/sys/devices/system/node/node<id>/cpulist`.
@@ -98,7 +139,7 @@
   - if user partitions have been created, the selected two trays must belong to the same NVLink partition or the sample must fail preflight
 - `scripts/preflight_imex.sh` will support:
   - local-only mode: validate the current node
-  - multi-host mode: `./scripts/preflight_imex.sh hosts.txt`
+  - rack mode: `./scripts/preflight_imex.sh rack.yaml`
 - The script will run the following checks and fail fast if any check fails:
   - local host checks:
     - `systemctl is-active nvidia-imex`
@@ -107,22 +148,26 @@
     - `nvidia-smi -L`
     - `ls /dev/nvidia-caps-imex-channels`
     - `cat /etc/nvidia-imex/nodes_config.cfg`
-  - multi-host checks when `hosts.txt` is provided:
-    - `ssh <host> systemctl is-active nvidia-imex`
-    - `ssh <host> ls /dev/nvidia-caps-imex-channels`
-    - `ssh <host> cat /etc/nvidia-imex/nodes_config.cfg`
-    - `ssh <host> nvidia-imex-ctl -N`
+  - rack-mode checks when `rack.yaml` is provided:
+    - parse each rack entry and use its `hostname` and `port` fields as the SSH target
+    - `ssh -p <port> <control-host> hostname`
+    - `ssh -p <port> <control-host> systemctl is-active nvidia-imex`
+    - `ssh -p <port> <control-host> ls /dev/nvidia-caps-imex-channels`
+    - `ssh -p <port> <control-host> cat /etc/nvidia-imex/nodes_config.cfg`
+    - `ssh -p <port> <control-host> nvidia-imex-ctl -N`
 - The script will print:
   - hostname
   - GPU inventory
+  - rack YAML host label, control-plane address, and SSH port
   - IMEX channel inventory
   - normalized `nodes_config.cfg` membership
   - IMEX domain health
   - a note that GPU-to-NUMA uniqueness for the selected pairs will be revalidated inside the binary
 - The script will enforce the following policy:
   - every selected node must expose `channel0`
-  - every selected node must have identical normalized `nodes_config.cfg` contents
-  - `nvidia-imex-ctl -N` on every selected node must show all nodes from `nodes_config.cfg` in `READY` state, or explicitly mark unreachable nodes as out of scope if the deployment is intentionally per-job
+  - every selected container's `hostname` output must match the corresponding rack YAML key, unless the user documents that `MNNVL_HOST_LABEL` will be used at launch
+  - every selected container must have identical normalized `nodes_config.cfg` contents
+  - `nvidia-imex-ctl -N` in every selected container must show all nodes from `nodes_config.cfg` in `READY` state, or explicitly mark unreachable nodes as out of scope if the deployment is intentionally per-job
   - if `nodes_config.cfg` contains more than the 2 selected trays, that is acceptable for this sample as long as the selected trays are in the same healthy IMEX domain
 - External admin-side NVLink partition verification:
   - this cannot be verified from the CUDA process on the compute tray
@@ -144,17 +189,31 @@
 ## Core Data Structures
 - `Config`
   - parsed CLI values
-  - tray GPU lists
+  - rack config path
+  - reference-check byte count
   - byte counts
   - iteration counts
   - output mode
+- `RackEntry`
+  - `host_label`
+  - `control_hostname`
+  - `ssh_port`
+  - ordered local CUDA device list
+- `RackConfig`
+  - ordered list of `RackEntry`
+  - helper lookup by host label
+  - helper to emit MPI host aliases as `<host_label>:2`
+  - helper to emit an SSH config with per-host `HostName` and `Port`
 - `RankInfo`
   - `world_rank`
   - `world_size`
   - `local_rank`
   - `local_size`
-  - `tray_index`
-  - `tray_count`
+  - `rack_index`
+  - `rack_count`
+  - `host_label`
+  - `control_hostname`
+  - `ssh_port`
   - `hostname`
   - `gpu_ordinal`
   - `host_numa_id`
@@ -221,12 +280,15 @@
   - free reserved VA ranges
 
 ## Execution Sequence
-1. Parse CLI and initialize MPI.
-2. Discover `world_rank`, `local_rank`, hostname set, tray index, and selected GPU ordinal.
+1. Parse CLI, parse `rack.yaml`, and initialize MPI.
+2. Discover `world_rank`, `local_rank`, hostname set, matched rack entry, and selected GPU ordinal.
 3. Select CUDA device, obtain current context, query capability attributes, query `HOST_NUMA_ID`, and pin CPU affinity.
 4. Validate:
    - 4 ranks total
-   - 2 ranks per host
+   - 2 ranks per selected container
+   - 2 rack entries in the YAML
+   - 2 unique device indices per rack entry
+   - every MPI host maps to exactly one rack entry
    - different NUMA CPU per selected local GPU pair
    - all GPUs support VMM, fabric handles, and multicast
 5. Determine datatype support:
@@ -284,7 +346,7 @@
 - Reasoning encoded into the program:
   - runtime support for SHARP requires multicast capability on the device
   - executable datatype support requires a compiled `multimem` kernel path
-  - this implementation only ships an `E4M3` kernel because CUDA 13.0 does not expose a direct `NVFP4` or `MXFP4` SHARP reduction path through the chosen `multimem` API
+  - this implementation only ships an `E4M3` kernel because CUDA 13.1 does not expose a direct `NVFP4` or `MXFP4` SHARP reduction path through the chosen `multimem` API
 - Output example:
   - `datatype_support: {"e4m3":"supported","nvfp4":"unsupported","mxfp4":"unsupported"}`
 
@@ -313,7 +375,7 @@
 - Scaling plan for the CPU reference:
   - default to comparing the first `16 MiB` of payload for precision metrics to keep host cost bounded
   - always compare the full-rank hashes for whole-buffer identity
-  - allow full-buffer CPU reference by setting `--cpu-ref-sample-bytes` equal to `--bytes`
+  - allow full-buffer CPU reference by setting `--reference-check-bytes` equal to `--bytes`
 
 ## Timing Plan
 - Device timing:
@@ -334,7 +396,7 @@
 
 ## Logging and Output
 - Human-readable summary:
-  - tray and GPU selection
+  - rack entry and GPU selection
   - detected NUMA IDs
   - capability matrix
   - datatype support matrix
@@ -356,22 +418,28 @@
 - `scripts/preflight_imex.sh`
   - usage:
     - `./scripts/preflight_imex.sh`
-    - `./scripts/preflight_imex.sh hosts.txt`
+    - `./scripts/preflight_imex.sh rack.yaml`
   - behavior:
     - local mode validates IMEX service, channel devices, local `nodes_config.cfg`, and local topology
-    - multi-host mode compares `nodes_config.cfg` across the selected hosts and summarizes `nvidia-imex-ctl -N` state for each host
+    - rack mode parses `rack.yaml`, SSHes to each container using its `hostname` and optional `port`, compares `nodes_config.cfg` across the selected containers, and summarizes `nvidia-imex-ctl -N` state for each container
     - prints a reminder that NVLink partition verification is an external switch-side admin check, not a compute-node check
 - `scripts/run_mnnvl_sharp.sh`
   - usage:
-    - `./scripts/run_mnnvl_sharp.sh hosts.txt`
+    - `./scripts/run_mnnvl_sharp.sh rack.yaml`
   - behavior:
     - build the project if needed
-    - run `mpirun -np 4 --hostfile hosts.txt --map-by ppr:2:node ./build/mnnvl_sharp_allreduce`
-    - pass through additional CLI arguments after the hostfile
-    - print a warning if the preflight summary indicates that the selected hosts are in a larger rack-wide IMEX domain than the job itself
+    - derive the MPI host list from `rack.yaml` with PyYAML by using each rack entry's host label with two slots
+    - generate a temporary SSH config mapping each host label to its `hostname` and `port`
+    - resolve `rack.yaml` to an absolute path and verify the same path is readable inside every selected container
+    - verify the executable path is present and executable inside every selected container
+    - run `mpirun -np 4 --host <label0>:2,<label1>:2 --map-by ppr:2:node --mca plm_rsh_args "-F <tmp-ssh-config>" ./build/mnnvl_sharp_allreduce --rack-config <abs-rack-yaml>`
+    - pass through additional CLI arguments after the rack config path
+    - print a warning if the preflight summary indicates that the selected containers are in a larger rack-wide IMEX domain than the job itself
 
 ## Acceptance Criteria
 - The binary launches successfully with 4 ranks across 2 trays.
+- The binary accepts `--rack-config rack.yaml` and rejects malformed rack YAML with actionable errors.
+- The launcher can reach each privileged CUDA container using the YAML `hostname` and `port`, with `port` defaulting to `4399`.
 - Preflight confirms that the selected trays are in the same IMEX domain and have access to `channel0`.
 - Operator-side fabric check confirms either:
   - the rack is on the default 72-GPU NVLink partition, or
@@ -387,8 +455,8 @@
 - Timing statistics are printed when at least 1 measured iteration completes successfully.
 
 ## Implementation Order
-1. Set up `CMakeLists.txt`, executable skeleton, and CLI parsing.
-2. Implement MPI topology discovery, tray mapping, GPU selection, and NUMA validation.
+1. Set up `CMakeLists.txt`, executable skeleton, CLI parsing, and `yaml-cpp` integration.
+2. Implement rack YAML parsing, MPI topology discovery, rack-entry mapping, GPU selection, and NUMA validation.
 3. Implement CUDA capability checks and CPU affinity pinning.
 4. Implement local fabric allocation plus handle export/import.
 5. Implement symmetric unicast mapping and the canary smoke test.
@@ -399,12 +467,12 @@
 10. Add helper scripts and README usage documentation.
 
 ## Risks and Defaults
-- Default: treat tray ordering as hostfile ordering. The scripts and README must state this explicitly.
+- Default: treat rack YAML order as tray order and MPI host order. The scripts and README must state this explicitly.
 - Default: assume the NVL72 rack remains on the default 72-GPU NVLink partition unless an operator states otherwise.
 - Default: accept a rack-wide IMEX domain even when the job only uses 2 trays, as long as the selected trays are healthy members of that same domain.
 - Default: only `E4M3` is executable in v1. FP4 support remains a reported capability decision, not a runtime path.
-- Risk: CUDA 13.0 Blackwell toolchain naming may differ across environments. The configure step must fail loudly instead of guessing.
+- Risk: CUDA 13.1 Blackwell toolchain naming may differ across environments. The configure step must fail loudly instead of guessing.
 - Risk: exact SHARP semantic behavior may differ from the planned `FP16` accumulation model. If the first hardware run disagrees, the semantic reference becomes the first item to recalibrate using observed results and PTX documentation.
 - Risk: full 1 GiB CPU reference is expensive. The default sampled precision comparison keeps runtime practical while still validating end-to-end correctness through hashes.
-- Risk: `channel0` availability alone does not prove IMEX membership consistency. The preflight must compare `nodes_config.cfg` and `nvidia-imex-ctl -N` state across the selected hosts.
+- Risk: `channel0` availability alone does not prove IMEX membership consistency. The preflight must compare `nodes_config.cfg` and `nvidia-imex-ctl -N` state across the selected containers.
 - Risk: if the rack has been split into user partitions, compute-node-only checks will not prove partition compatibility. The runbook must require one switch-side `nv show sdn partition` confirmation before debugging CUDA import failures.
