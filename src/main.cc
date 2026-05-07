@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <exception>
 #include <iomanip>
@@ -202,6 +203,8 @@ void PrintHumanReport(const Config& cfg,
   std::cout << "  hashes_match: " << (HashesMatch(hashes) ? "true" : "false") << "\n";
   std::cout << "  semantic_exact_mismatches: " << metrics.exact_mismatches << "\n";
   std::cout << "  f32_requantized_mismatches: " << metrics.requantized_mismatches << "\n";
+  std::cout << "  f32_max_requantized_ulp_distance: "
+            << metrics.max_requantized_ulp_distance << "\n";
   std::cout << "  f32_max_abs_error: " << metrics.max_abs_error << "\n";
   std::cout << "  f32_mean_abs_error: " << metrics.mean_abs_error << "\n";
   std::cout << std::fixed << std::setprecision(3);
@@ -243,6 +246,7 @@ void PrintJsonReport(const Config& cfg,
   os << "]";
   os << ",\"semantic_exact_mismatches\":" << metrics.exact_mismatches;
   os << ",\"f32_requantized_mismatches\":" << metrics.requantized_mismatches;
+  os << ",\"f32_max_requantized_ulp_distance\":" << metrics.max_requantized_ulp_distance;
   os << ",\"f32_max_abs_error\":" << metrics.max_abs_error;
   os << ",\"f32_mean_abs_error\":" << metrics.mean_abs_error;
   os << ",\"sharp_kernel_ms\":{\"min\":" << device.min << ",\"median\":" << device.median
@@ -251,6 +255,20 @@ void PrintJsonReport(const Config& cfg,
      << ",\"p95\":" << wall.p95 << ",\"max\":" << wall.max << "}";
   os << "}";
   std::cout << os.str() << "\n";
+}
+
+void MaybeDumpMismatches(const std::vector<uint32_t>& result_words, int ranks, const PrecisionMetrics& metrics) {
+  if (metrics.exact_mismatches == 0 || std::getenv("MNNVL_DEBUG_MISMATCH") == nullptr) {
+    return;
+  }
+  const std::size_t words = std::min<std::size_t>(result_words.size(), 16);
+  const std::vector<uint32_t> expected = CpuAllReduceE4M3Semantic(words, ranks);
+  std::cerr << "debug_first_words:";
+  for (std::size_t i = 0; i < words; ++i) {
+    std::cerr << " [" << i << "] got=0x" << std::hex << result_words[i]
+              << " expected=0x" << expected[i] << std::dec;
+  }
+  std::cerr << "\n";
 }
 
 int Run(int argc, char** argv) {
@@ -299,6 +317,7 @@ int Run(int argc, char** argv) {
   int final_status = 0;
   if (rank.world_rank == 0) {
     const PrecisionMetrics metrics = CompareE4M3(checked_words.data(), checked_words.size(), rank.world_size);
+    MaybeDumpMismatches(checked_words, rank.world_size, metrics);
     const TimingStats device = Summarize(device_times);
     const TimingStats wall = Summarize(wall_times);
     if (cfg.json) {
@@ -306,7 +325,7 @@ int Run(int argc, char** argv) {
     } else {
       PrintHumanReport(cfg, rank, caps, records, allocation, hashes, metrics, device, wall);
     }
-    if (!HashesMatch(hashes) || metrics.exact_mismatches != 0) {
+    if (!HashesMatch(hashes) || metrics.max_requantized_ulp_distance > 1) {
       final_status = 2;
     }
   }

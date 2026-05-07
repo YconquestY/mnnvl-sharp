@@ -26,8 +26,18 @@ shift
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 rack_yaml_abs=$(realpath "$rack_yaml")
+app_dir=${MNNVL_APP_DIR:-/home/ubuntu/mnnvl_sharp}
 build_dir="$repo_root/build"
+remote_build_dir="$app_dir/build"
 exe="$build_dir/mnnvl_sharp_allreduce"
+remote_exe="$remote_build_dir/mnnvl_sharp_allreduce"
+ssh_identity=${MNNVL_SSH_IDENTITY:-/home/ubuntu/.ssh/id_rsa}
+ssh_known_hosts=${MNNVL_SSH_KNOWN_HOSTS:-/home/ubuntu/.ssh/known_hosts}
+ssh_user=${MNNVL_SSH_USER:-ubuntu}
+local_label=${MNNVL_LOCAL_LABEL:-$(hostname -s)}
+cuda_compiler=${MNNVL_CUDA_COMPILER:-/usr/local/cuda/bin/nvcc}
+cuda_arch=${MNNVL_CUDA_ARCHITECTURES:-100a}
+mpi_tcp_if=${MNNVL_MPI_TCP_IF_INCLUDE:-10.135.1.0/26}
 
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
 python3 - <<'PY' >/dev/null 2>&1 || die "PyYAML is required"
@@ -39,20 +49,26 @@ command -v ssh >/dev/null 2>&1 || die "ssh is required"
 
 mkdir -p "$build_dir"
 if [[ ! -x "$exe" ]]; then
-  cmake -S "$repo_root" -B "$build_dir" -DCMAKE_BUILD_TYPE=RelWithDebInfo
+  CUDACXX="$cuda_compiler" cmake -S "$repo_root" -B "$build_dir" \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_CUDA_COMPILER="$cuda_compiler" \
+    -DCMAKE_CUDA_ARCHITECTURES="$cuda_arch"
   cmake --build "$build_dir" -j"$(nproc)"
 fi
 
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
+entries_file="$tmpdir/entries.tsv"
 host_file="$tmpdir/hosts.txt"
 ssh_config="$tmpdir/ssh_config"
 
-python3 - "$rack_yaml_abs" "$host_file" "$ssh_config" <<'PY'
+python3 - "$rack_yaml_abs" "$host_file" "$ssh_config" "$entries_file" \
+  "$ssh_identity" "$ssh_known_hosts" "$ssh_user" <<'PY'
 import sys
 import yaml
 
-rack_yaml, host_file, ssh_config = sys.argv[1:4]
+rack_yaml, host_file, ssh_config, entries_file = sys.argv[1:5]
+ssh_identity, ssh_known_hosts, ssh_user = sys.argv[5:8]
 with open(rack_yaml, "r", encoding="utf-8") as f:
     doc = yaml.safe_load(f)
 if not isinstance(doc, dict) or not isinstance(doc.get("rack"), list):
@@ -90,40 +106,45 @@ with open(ssh_config, "w", encoding="utf-8") as f:
     for label, host, port in entries:
         f.write(f"Host {label}\n")
         f.write(f"  HostName {host}\n")
+        f.write(f"  User {ssh_user}\n")
         f.write(f"  Port {port}\n")
+        f.write(f"  IdentityFile {ssh_identity}\n")
+        f.write("  IdentitiesOnly yes\n")
+        f.write("  PasswordAuthentication no\n")
+        f.write(f"  UserKnownHostsFile {ssh_known_hosts}\n")
         f.write("  StrictHostKeyChecking accept-new\n")
         f.write("  BatchMode yes\n\n")
+
+with open(entries_file, "w", encoding="utf-8") as f:
+    for label, host, port in entries:
+        f.write(f"{label}\t{host}\t{port}\n")
 PY
 
 host_list=$(cat "$host_file")
 
-python3 - "$rack_yaml_abs" "$exe" <<'PY'
-import subprocess
-import sys
-import yaml
+test -x "$exe" || die "local executable is missing after build: $exe"
 
-rack_yaml, exe = sys.argv[1:3]
-with open(rack_yaml, "r", encoding="utf-8") as f:
-    doc = yaml.safe_load(f)
-for item in doc["rack"]:
-    label, body = next(iter(item.items()))
-    merged = {}
-    if isinstance(body, list):
-        for part in body:
-            merged.update(part)
-    else:
-        merged = body
-    host = merged["hostname"]
-    port = str(merged.get("port", 4399))
-    for path, test_flag in [(rack_yaml, "-r"), (exe, "-x")]:
-        cmd = ["ssh", "-p", port, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
-               host, "test", test_flag, path]
-        subprocess.check_call(cmd)
-PY
+while IFS=$'\t' read -r label _host _port; do
+  if [[ "${label%%.*}" == "${local_label%%.*}" ]]; then
+    continue
+  fi
+  echo "preparing $label:$app_dir"
+  if ! ssh -n -F "$ssh_config" "$label" test -r "$rack_yaml_abs"; then
+    scp -F "$ssh_config" "$rack_yaml_abs" "$label:$rack_yaml_abs"
+  fi
+  ssh -n -F "$ssh_config" "$label" \
+    "cd '$app_dir' && CUDACXX='$cuda_compiler' cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CUDA_COMPILER='$cuda_compiler' -DCMAKE_CUDA_ARCHITECTURES='$cuda_arch' && cmake --build build -j\$(nproc)"
+  ssh -n -F "$ssh_config" "$label" test -x "$remote_exe"
+done < "$entries_file"
 
 echo "launching mnnvl_sharp_allreduce on $host_list"
 mpirun -np 4 \
+  --allow-run-as-root \
   --host "$host_list" \
   --map-by ppr:2:node \
+  --mca pml ob1 \
+  --mca btl self,vader,tcp \
+  --mca btl_tcp_if_include "$mpi_tcp_if" \
+  --mca oob_tcp_if_include "$mpi_tcp_if" \
   --mca plm_rsh_args "-F $ssh_config" \
-  "$exe" --rack-config "$rack_yaml_abs" "$@"
+  "$remote_exe" --rack-config "$rack_yaml_abs" "$@"

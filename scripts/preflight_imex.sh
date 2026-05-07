@@ -21,6 +21,11 @@ have() {
   command -v "$1" >/dev/null 2>&1
 }
 
+MNNVL_SSH_CONFIG=${MNNVL_SSH_CONFIG:-/home/ubuntu/.ssh/config}
+MNNVL_SSH_IDENTITY=${MNNVL_SSH_IDENTITY:-/home/ubuntu/.ssh/id_rsa}
+MNNVL_SSH_KNOWN_HOSTS=${MNNVL_SSH_KNOWN_HOSTS:-/home/ubuntu/.ssh/known_hosts}
+MNNVL_SSH_USER=${MNNVL_SSH_USER:-ubuntu}
+
 normalize_nodes_config() {
   sed -e 's/#.*$//' -e '/^[[:space:]]*$/d' "$1" | awk '{$1=$1; print}' | sort
 }
@@ -36,7 +41,9 @@ run_local_checks() {
   nvidia-smi topo -m
 
   echo "== nvidia-imex service =="
-  systemctl is-active nvidia-imex
+  if ! systemctl is-active nvidia-imex 2>/dev/null; then
+    pgrep -a nvidia-imex || echo "warning: nvidia-imex service state not visible in this container"
+  fi
 
   echo "== imex channels =="
   ls -la /dev/nvidia-caps-imex-channels
@@ -46,7 +53,11 @@ run_local_checks() {
   cat /etc/nvidia-imex/nodes_config.cfg
 
   echo "== nvidia-imex-ctl -N =="
-  nvidia-imex-ctl -N
+  if command -v nvidia-imex-ctl >/dev/null 2>&1; then
+    nvidia-imex-ctl -N
+  else
+    echo "warning: nvidia-imex-ctl is not installed in this container"
+  fi
 
   cat <<'NOTE'
 == nvlink partition reminder ==
@@ -97,7 +108,30 @@ remote() {
   local port=$1
   local host=$2
   shift 2
-  ssh -p "$port" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$host" "$@"
+  ssh -n \
+    -F "$MNNVL_SSH_CONFIG" \
+    -i "$MNNVL_SSH_IDENTITY" \
+    -o IdentitiesOnly=yes \
+    -o PasswordAuthentication=no \
+    -o UserKnownHostsFile="$MNNVL_SSH_KNOWN_HOSTS" \
+    -o StrictHostKeyChecking=accept-new \
+    -p "$port" \
+    "${MNNVL_SSH_USER}@${host}" \
+    "$@"
+}
+
+check_remote_imex_service() {
+  local port=$1
+  local host=$2
+  remote "$port" "$host" \
+    'systemctl is-active nvidia-imex 2>/dev/null || pgrep -a nvidia-imex || { command -v nvidia-imex-ctl >/dev/null 2>&1 && nvidia-imex-ctl -N >/dev/null; } || echo "warning: nvidia-imex service state not visible in this container"'
+}
+
+check_remote_imex_health() {
+  local port=$1
+  local host=$2
+  remote "$port" "$host" \
+    'if command -v nvidia-imex-ctl >/dev/null 2>&1; then nvidia-imex-ctl -N; else echo "warning: nvidia-imex-ctl is not installed in this container"; fi'
 }
 
 run_rack_checks() {
@@ -111,7 +145,7 @@ PY
 
   local tmpdir
   tmpdir=$(mktemp -d)
-  trap 'rm -rf "$tmpdir"' EXIT
+  trap "rm -rf '$tmpdir'" EXIT
 
   local idx=0
   local first_nodes=""
@@ -129,7 +163,7 @@ PY
     fi
 
     echo "-- nvidia-imex service"
-    remote "$port" "$host" systemctl is-active nvidia-imex
+    check_remote_imex_service "$port" "$host"
 
     echo "-- imex channels"
     remote "$port" "$host" ls -la /dev/nvidia-caps-imex-channels
@@ -139,7 +173,7 @@ PY
     remote "$port" "$host" nvidia-smi -L
 
     echo "-- imex health"
-    remote "$port" "$host" nvidia-imex-ctl -N
+    check_remote_imex_health "$port" "$host"
 
     local nodes_file="$tmpdir/nodes_$idx.cfg"
     remote "$port" "$host" cat /etc/nvidia-imex/nodes_config.cfg >"$nodes_file"

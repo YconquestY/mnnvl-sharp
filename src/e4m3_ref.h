@@ -9,6 +9,7 @@ namespace mnnvl {
 struct PrecisionMetrics {
   std::size_t exact_mismatches = 0;
   std::size_t requantized_mismatches = 0;
+  int max_requantized_ulp_distance = 0;
   float max_abs_error = 0.0f;
   double mean_abs_error = 0.0;
 };

@@ -100,6 +100,14 @@ uint8_t SemanticByteForElement(std::size_t element_index, int ranks) {
   return EncodeE4M3(acc);
 }
 
+int OrderedFiniteE4M3Code(uint8_t bits) {
+  const int magnitude = bits & 0x7f;
+  if (bits & 0x80) {
+    return 0x80 - magnitude;
+  }
+  return 0x80 + magnitude;
+}
+
 }  // namespace
 
 uint8_t DeterministicE4M3Byte(int rank, std::size_t element_index) {
@@ -229,9 +237,14 @@ PrecisionMetrics CompareE4M3(const uint32_t* result_words, std::size_t word_coun
       const float err = std::fabs(got - f32[element]);
       metrics.max_abs_error = std::max(metrics.max_abs_error, err);
       abs_sum += err;
-      if (got_bits != EncodeE4M3(f32[element])) {
+      const uint8_t requantized_bits = EncodeE4M3(f32[element]);
+      if (got_bits != requantized_bits) {
         ++metrics.requantized_mismatches;
       }
+      metrics.max_requantized_ulp_distance =
+          std::max(metrics.max_requantized_ulp_distance,
+                   std::abs(OrderedFiniteE4M3Code(got_bits) -
+                            OrderedFiniteE4M3Code(requantized_bits)));
     }
   }
   metrics.mean_abs_error = word_count == 0 ? 0.0 : abs_sum / static_cast<double>(word_count * 4);
