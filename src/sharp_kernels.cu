@@ -1,5 +1,6 @@
 #include "sharp_kernels.h"
 
+#include <cuda/ptx>
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
@@ -28,10 +29,15 @@ __device__ uint32_t deterministic_e4m3_word(int rank, std::size_t word_index) {
   return word;
 }
 
-__device__ uint64_t as_global_address(const void* ptr) {
-  uint64_t addr = 0;
-  asm("cvta.to.global.u64 %0, %1;" : "=l"(addr) : "l"(ptr));
-  return addr;
+__device__ uint32_t multimem_ld_reduce_e4m3x4_acc_f16(const uint32_t* addr) {
+  uint32_t reduced = 0;
+  const uint64_t global_addr = static_cast<uint64_t>(__cvta_generic_to_global(addr));
+  // CUDA 13.1 CCCL does not wrap the FP8 SHARP form with acc::f16.e4m3x4.
+  asm volatile("multimem.ld_reduce.weak.global.add.acc::f16.e4m3x4 %0, [%1];"
+               : "=r"(reduced)
+               : "l"(global_addr)
+               : "memory");
+  return reduced;
 }
 
 __global__ void init_e4m3_kernel(uint32_t* dst_words, std::size_t word_count, int world_rank) {
@@ -45,7 +51,7 @@ __global__ void init_e4m3_kernel(uint32_t* dst_words, std::size_t word_count, in
 __global__ void alias_fence_kernel() {
   if (threadIdx.x == 0 && blockIdx.x == 0) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
-    asm volatile("fence.proxy.alias;" : : : "memory");
+    cuda::ptx::fence_proxy_alias();
 #endif
   }
 }
@@ -54,20 +60,12 @@ __global__ void sharp_allreduce_e4m3_kernel(uint32_t* mc_alias_words, std::size_
   const std::size_t stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
   for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < word_count; i += stride) {
-    uint32_t reduced = 0;
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    const uint64_t addr = as_global_address(mc_alias_words + i);
-    asm volatile("multimem.ld_reduce.weak.global.add.acc::f16.e4m3x4 %0, [%1];"
-                 : "=r"(reduced)
-                 : "l"(addr)
-                 : "memory");
-    asm volatile("multimem.st.weak.global.e4m3x4 [%0], %1;"
-                 :
-                 : "l"(addr), "r"(reduced)
-                 : "memory");
+    const uint32_t reduced = multimem_ld_reduce_e4m3x4_acc_f16(mc_alias_words + i);
+    // The reduced e4m3x4 payload is already packed in one 32-bit register.
+    cuda::ptx::multimem_st(cuda::ptx::sem_weak, mc_alias_words + i, reduced);
 #else
     (void)mc_alias_words;
-    reduced = 0;
 #endif
   }
 }

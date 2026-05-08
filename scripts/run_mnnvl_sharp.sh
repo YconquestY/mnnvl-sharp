@@ -65,6 +65,7 @@ local_label=${MNNVL_LOCAL_LABEL:-$(hostname -s)}
 cuda_compiler=${MNNVL_CUDA_COMPILER:-/usr/local/cuda/bin/nvcc}
 cuda_arch=${MNNVL_CUDA_ARCHITECTURES:-100a}
 mpi_tcp_if=${MNNVL_MPI_TCP_IF_INCLUDE:-10.135.1.0/26}
+skip_remote_build=${MNNVL_SKIP_REMOTE_BUILD:-0}
 
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
 python3 - <<'PY' >/dev/null 2>&1 || die "PyYAML is required"
@@ -230,8 +231,10 @@ while IFS=$'\t' read -r label _host _port; do
   if ! ssh -n -F "$ssh_config" "$label" test -r "$rack_yaml_abs"; then
     scp -F "$ssh_config" "$rack_yaml_abs" "$label:$rack_yaml_abs"
   fi
-  ssh -n -F "$ssh_config" "$label" \
-    "cd '$app_dir' && CUDACXX='$cuda_compiler' cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CUDA_COMPILER='$cuda_compiler' -DCMAKE_CUDA_ARCHITECTURES='$cuda_arch' && cmake --build build -j\$(nproc)"
+  if [[ "$skip_remote_build" != "1" ]]; then
+    ssh -n -F "$ssh_config" "$label" \
+      "cd '$app_dir' && CUDACXX='$cuda_compiler' cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CUDA_COMPILER='$cuda_compiler' -DCMAKE_CUDA_ARCHITECTURES='$cuda_arch' && cmake --build build -j\$(nproc)"
+  fi
   ssh -n -F "$ssh_config" "$label" test -x "$remote_exe"
 done < "$entries_file"
 
