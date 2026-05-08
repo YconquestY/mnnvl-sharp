@@ -47,6 +47,35 @@ if(MNNVL_BLACKWELL_ARCH STREQUAL "")
   message(FATAL_ERROR "CUDA compiler does not expose a feature-specific Blackwell target such as sm_100a required for multimem FP8")
 endif()
 
+set(MNNVL_TMA_ASYNC_CHECK "${CMAKE_BINARY_DIR}/mnnvl_check_tma_async.cu")
+file(WRITE "${MNNVL_TMA_ASYNC_CHECK}" [[
+#include <cuda/ptx>
+#include <cuda_fp16.h>
+#include <stdint.h>
+__device__ void check_tma(__half* dst, const __half* src, uint32_t bytes) {
+  const uint64_t g = static_cast<uint64_t>(__cvta_generic_to_global(dst));
+  const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(src));
+  asm volatile("multimem.cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.f16 [%0], [%1], %2;"
+               : : "l"(g), "r"(s), "r"(bytes) : "memory");
+  cuda::ptx::cp_async_bulk_commit_group();
+  cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<0>{});
+  cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+}
+]])
+execute_process(
+  COMMAND "${CMAKE_CUDA_COMPILER}" -std=c++20 "-arch=sm_${MNNVL_BLACKWELL_ARCH}"
+          -c "${MNNVL_TMA_ASYNC_CHECK}" -o "${CMAKE_BINARY_DIR}/mnnvl_check_tma_async.o"
+  OUTPUT_VARIABLE MNNVL_TMA_ASYNC_CHECK_OUT
+  ERROR_VARIABLE MNNVL_TMA_ASYNC_CHECK_ERR
+  RESULT_VARIABLE MNNVL_TMA_ASYNC_CHECK_RC
+)
+if(MNNVL_TMA_ASYNC_CHECK_RC EQUAL 0)
+  set(MNNVL_SHARP_HAS_TMA_ASYNC 1)
+else()
+  set(MNNVL_SHARP_HAS_TMA_ASYNC 0)
+  message(WARNING "CUDA compiler does not accept multimem.cp.reduce.async.bulk; tma_async backend will report unsupported: ${MNNVL_TMA_ASYNC_CHECK_ERR}")
+endif()
+
 add_executable(mnnvl_sharp_allreduce
   src/config.cc
   src/e4m3_ref.cc
@@ -65,6 +94,7 @@ set_target_properties(mnnvl_sharp_allreduce PROPERTIES
 
 target_compile_definitions(mnnvl_sharp_allreduce PRIVATE
   MNNVL_SHARP_HAS_E4M3=1
+  MNNVL_SHARP_HAS_TMA_ASYNC=${MNNVL_SHARP_HAS_TMA_ASYNC}
 )
 
 target_compile_options(mnnvl_sharp_allreduce PRIVATE

@@ -1,6 +1,7 @@
 #include "sharp_kernels.h"
 
 #include <cuda/ptx>
+#include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
@@ -8,6 +9,10 @@
 #include <string>
 
 #include "runtime.h"
+
+#ifndef MNNVL_SHARP_HAS_TMA_ASYNC
+#define MNNVL_SHARP_HAS_TMA_ASYNC 0
+#endif
 
 namespace mnnvl {
 namespace {
@@ -29,6 +34,22 @@ __device__ uint32_t deterministic_e4m3_word(int rank, std::size_t word_index) {
   return word;
 }
 
+__device__ uint16_t deterministic_f16_bits(int rank, std::size_t element_index) {
+  constexpr uint16_t kValues[] = {
+      0xb800u,  // -0.5
+      0xb400u,  // -0.25
+      0xb000u,  // -0.125
+      0x0000u,  //  0.0
+      0x3000u,  //  0.125
+      0x3400u,  //  0.25
+      0x3800u,  //  0.5
+      0x0000u,  //  0.0
+  };
+  const uint32_t mix = static_cast<uint32_t>((element_index * 13u) ^ (element_index >> 5) ^
+                                            (static_cast<std::size_t>(rank + 1) * 7u));
+  return kValues[mix & 7u];
+}
+
 __device__ uint32_t multimem_ld_reduce_e4m3x4_acc_f16(const uint32_t* addr) {
   uint32_t reduced = 0;
   const uint64_t global_addr = static_cast<uint64_t>(__cvta_generic_to_global(addr));
@@ -40,6 +61,18 @@ __device__ uint32_t multimem_ld_reduce_e4m3x4_acc_f16(const uint32_t* addr) {
   return reduced;
 }
 
+#if MNNVL_SHARP_HAS_TMA_ASYNC
+__device__ void multimem_cp_reduce_async_bulk_add_noftz_f16(__half* dst, const __half* src, uint32_t bytes) {
+  const uint64_t global_addr = static_cast<uint64_t>(__cvta_generic_to_global(dst));
+  const uint32_t shared_addr = static_cast<uint32_t>(__cvta_generic_to_shared(src));
+  // CUDA 13.1 CCCL wraps cp.reduce.async.bulk, but not the PTX 9.1 multimem form.
+  asm volatile("multimem.cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.f16 [%0], [%1], %2;"
+               :
+               : "l"(global_addr), "r"(shared_addr), "r"(bytes)
+               : "memory");
+}
+#endif
+
 __global__ void init_e4m3_kernel(uint32_t* dst_words, std::size_t word_count, int world_rank) {
   const std::size_t stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
   for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -48,10 +81,26 @@ __global__ void init_e4m3_kernel(uint32_t* dst_words, std::size_t word_count, in
   }
 }
 
+__global__ void init_f16_kernel(uint16_t* dst, std::size_t element_count, int world_rank) {
+  const std::size_t stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+  for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < element_count; i += stride) {
+    dst[i] = deterministic_f16_bits(world_rank, i);
+  }
+}
+
 __global__ void alias_fence_kernel() {
   if (threadIdx.x == 0 && blockIdx.x == 0) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
     cuda::ptx::fence_proxy_alias();
+#endif
+  }
+}
+
+__global__ void async_proxy_fence_kernel() {
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cuda::ptx::fence_proxy_async(cuda::ptx::space_global);
 #endif
   }
 }
@@ -69,6 +118,47 @@ __global__ void sharp_allreduce_e4m3_kernel(uint32_t* mc_alias_words, std::size_
 #endif
   }
 }
+
+#if MNNVL_SHARP_HAS_TMA_ASYNC
+__global__ void sharp_allreduce_f16_tma_async_kernel(const uint16_t* input,
+                                                     uint16_t* mc_output,
+                                                     std::size_t element_count) {
+  constexpr std::size_t kTileBytes = 4096;
+  extern __shared__ __align__(16) unsigned char shared_tile[];
+
+  const std::size_t total_bytes = element_count * sizeof(uint16_t);
+  const std::size_t tile_count = (total_bytes + kTileBytes - 1) / kTileBytes;
+  if (threadIdx.x == 0) {
+    cuda::ptx::fence_proxy_async(cuda::ptx::space_global);
+  }
+  __syncthreads();
+
+  for (std::size_t tile = blockIdx.x; tile < tile_count; tile += gridDim.x) {
+    const std::size_t byte_offset = tile * kTileBytes;
+    const std::size_t remaining = total_bytes - byte_offset;
+    const std::size_t tile_bytes = remaining < kTileBytes ? remaining : kTileBytes;
+    const std::size_t vector_count = tile_bytes / sizeof(uint4);
+    const auto* src4 = reinterpret_cast<const uint4*>(
+        reinterpret_cast<const unsigned char*>(input) + byte_offset);
+    auto* shared4 = reinterpret_cast<uint4*>(shared_tile);
+    for (std::size_t i = threadIdx.x; i < vector_count; i += blockDim.x) {
+      shared4[i] = src4[i];
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+      cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
+      auto* dst = reinterpret_cast<__half*>(reinterpret_cast<unsigned char*>(mc_output) + byte_offset);
+      auto* src = reinterpret_cast<const __half*>(shared_tile);
+      multimem_cp_reduce_async_bulk_add_noftz_f16(dst, src, static_cast<uint32_t>(tile_bytes));
+      cuda::ptx::cp_async_bulk_commit_group();
+      cuda::ptx::cp_async_bulk_wait_group_read(cuda::ptx::n32_t<0>{});
+      cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+    }
+    __syncthreads();
+  }
+}
+#endif
 
 __global__ void canary_kernel(uint32_t* self_slot_words, uint32_t rank_tag) {
   const int i = threadIdx.x;
@@ -117,14 +207,49 @@ void LaunchInitE4M3(uint32_t* dst_words, std::size_t word_count, int world_rank,
   CheckLaunch("init_e4m3_kernel");
 }
 
+void LaunchInitF16(uint16_t* dst, std::size_t element_count, int world_rank, cudaStream_t stream) {
+  init_f16_kernel<<<BlocksFor((element_count + 1) / 2), 256, 0, stream>>>(dst, element_count, world_rank);
+  CheckLaunch("init_f16_kernel");
+}
+
 void LaunchAliasFence(cudaStream_t stream) {
   alias_fence_kernel<<<1, 1, 0, stream>>>();
   CheckLaunch("alias_fence_kernel");
 }
 
+void LaunchAsyncProxyFence(cudaStream_t stream) {
+  async_proxy_fence_kernel<<<1, 1, 0, stream>>>();
+  CheckLaunch("async_proxy_fence_kernel");
+}
+
 void LaunchSharpAllReduceE4M3(uint32_t* mc_alias_words, std::size_t word_count, cudaStream_t stream) {
   sharp_allreduce_e4m3_kernel<<<BlocksFor(word_count), 256, 0, stream>>>(mc_alias_words, word_count);
   CheckLaunch("sharp_allreduce_e4m3_kernel");
+}
+
+void LaunchSharpAllReduceF16TmaAsync(const uint16_t* input,
+                                     uint16_t* mc_output,
+                                     std::size_t element_count,
+                                     cudaStream_t stream) {
+#if MNNVL_SHARP_HAS_TMA_ASYNC
+  if ((element_count % 8) != 0) {
+    throw std::runtime_error("TMA async F16 element_count must be a multiple of 8");
+  }
+  constexpr std::size_t kTileBytes = 4096;
+  constexpr int kThreads = 256;
+  constexpr int kMaxBlocks = 4096;
+  const std::size_t total_bytes = element_count * sizeof(uint16_t);
+  const std::size_t tile_count = (total_bytes + kTileBytes - 1) / kTileBytes;
+  const int blocks = static_cast<int>(tile_count < 1 ? 1 : (tile_count > kMaxBlocks ? kMaxBlocks : tile_count));
+  sharp_allreduce_f16_tma_async_kernel<<<blocks, kThreads, kTileBytes, stream>>>(input, mc_output, element_count);
+  CheckLaunch("sharp_allreduce_f16_tma_async_kernel");
+#else
+  (void)input;
+  (void)mc_output;
+  (void)element_count;
+  (void)stream;
+  throw std::runtime_error("TMA async SHARP backend was not compiled into this binary");
+#endif
 }
 
 void LaunchCanary(uint32_t* self_slot_words, uint32_t rank_tag, cudaStream_t stream) {

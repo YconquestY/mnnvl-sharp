@@ -20,6 +20,14 @@
 
 #include <sched.h>
 
+#ifndef MNNVL_SHARP_HAS_E4M3
+#define MNNVL_SHARP_HAS_E4M3 0
+#endif
+
+#ifndef MNNVL_SHARP_HAS_TMA_ASYNC
+#define MNNVL_SHARP_HAS_TMA_ASYNC 0
+#endif
+
 namespace mnnvl {
 namespace {
 
@@ -211,6 +219,11 @@ CapabilityInfo InitializeCudaAndQuery(RankInfo* rank) {
 #else
   caps.sharp_e4m3_supported = false;
 #endif
+#if MNNVL_SHARP_HAS_TMA_ASYNC
+  caps.sharp_tma_async_supported = caps.multicast_supported != 0;
+#else
+  caps.sharp_tma_async_supported = false;
+#endif
   caps.nvfp4_supported = false;
   caps.mxfp4_supported = false;
   return caps;
@@ -293,13 +306,20 @@ void ValidateRankMappings(const std::vector<RankMappingRecord>& records,
   }
 }
 
-void ValidateCapabilities(MPI_Comm world, const CapabilityInfo& caps) {
+void ValidateCapabilities(MPI_Comm world, const CapabilityInfo& caps, SharpBackend backend) {
+  bool backend_supported = false;
+  if (backend == SharpBackend::kLegacy) {
+    backend_supported = caps.sharp_e4m3_supported;
+  } else if (backend == SharpBackend::kTmaAsync) {
+    backend_supported = caps.sharp_tma_async_supported;
+  }
   const int local_ok = caps.vmm_supported && caps.fabric_handle_supported && caps.multicast_supported &&
-                       caps.sharp_e4m3_supported;
+                       backend_supported;
   int all_ok = 0;
   MPI_Allreduce(&local_ok, &all_ok, 1, MPI_INT, MPI_LAND, world);
   if (!all_ok) {
-    throw std::runtime_error("one or more selected GPUs lack VMM, fabric handle, multicast, or compiled E4M3 SHARP support");
+    throw std::runtime_error("one or more selected GPUs lack VMM, fabric handle, multicast, or compiled " +
+                             std::string(ToString(backend)) + " SHARP support");
   }
 }
 

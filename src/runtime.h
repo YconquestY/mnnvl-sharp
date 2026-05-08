@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "config.h"
 #include "rack_config.h"
 
 namespace mnnvl {
@@ -34,6 +35,7 @@ struct CapabilityInfo {
   int fabric_handle_supported = 0;
   int multicast_supported = 0;
   bool sharp_e4m3_supported = false;
+  bool sharp_tma_async_supported = false;
   bool nvfp4_supported = false;
   bool mxfp4_supported = false;
 };
@@ -75,7 +77,7 @@ std::vector<RankMappingRecord> GatherRankMappings(MPI_Comm world, const RankInfo
 void ValidateRankMappings(const std::vector<RankMappingRecord>& records,
                           const RackConfig& rack,
                           const RankPlan& plan);
-void ValidateCapabilities(MPI_Comm world, const CapabilityInfo& caps);
+void ValidateCapabilities(MPI_Comm world, const CapabilityInfo& caps, SharpBackend backend);
 void PinThreadToNuma(int numa_id);
 void Barrier(MPI_Comm comm);
 

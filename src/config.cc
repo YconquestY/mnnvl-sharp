@@ -44,14 +44,66 @@ std::string NeedValue(int& i, int argc, char** argv, const std::string& flag) {
   return argv[i];
 }
 
+SharpBackend ParseBackend(const std::string& value) {
+  if (value == "legacy") {
+    return SharpBackend::kLegacy;
+  }
+  if (value == "tma_async") {
+    return SharpBackend::kTmaAsync;
+  }
+  throw std::invalid_argument("--sharp-backend must be legacy or tma_async");
+}
+
+DataType ParseDataType(const std::string& value) {
+  if (value == "auto") {
+    return DataType::kAuto;
+  }
+  if (value == "e4m3") {
+    return DataType::kE4M3;
+  }
+  if (value == "f16") {
+    return DataType::kF16;
+  }
+  throw std::invalid_argument("--types must be auto, e4m3, or f16");
+}
+
 }  // namespace
+
+const char* ToString(SharpBackend backend) {
+  switch (backend) {
+    case SharpBackend::kLegacy:
+      return "legacy";
+    case SharpBackend::kTmaAsync:
+      return "tma_async";
+  }
+  return "unknown";
+}
+
+const char* ToString(DataType type) {
+  switch (type) {
+    case DataType::kAuto:
+      return "auto";
+    case DataType::kE4M3:
+      return "e4m3";
+    case DataType::kF16:
+      return "f16";
+  }
+  return "unknown";
+}
+
+DataType ResolveDataType(const Config& cfg) {
+  if (cfg.types != DataType::kAuto) {
+    return cfg.types;
+  }
+  return cfg.sharp_backend == SharpBackend::kLegacy ? DataType::kE4M3 : DataType::kF16;
+}
 
 std::string Usage(const char* argv0) {
   std::ostringstream os;
   os << "usage: " << argv0
      << " --rack-config rack.yaml [--rank-count N]"
-     << " [--rank-selection balanced|prefix] [--bytes 1073741824]"
-     << " [--warmup 3] [--iters 20] [--types auto|e4m3]"
+     << " [--rank-selection balanced|prefix] [--sharp-backend legacy|tma_async]"
+     << " [--bytes 1073741824] [--warmup 3] [--iters 20] [--types auto|e4m3|f16]"
      << " [--reference-check-bytes 16777216] [--init-only] [--json]\n";
   return os.str();
 }
@@ -66,6 +118,8 @@ Config ParseConfig(int argc, char** argv) {
       cfg.rank_count = ParseInt(NeedValue(i, argc, argv, arg), arg);
     } else if (arg == "--rank-selection") {
       cfg.rank_selection = NeedValue(i, argc, argv, arg);
+    } else if (arg == "--sharp-backend") {
+      cfg.sharp_backend = ParseBackend(NeedValue(i, argc, argv, arg));
     } else if (arg == "--bytes") {
       cfg.bytes = ParseSize(NeedValue(i, argc, argv, arg), arg);
     } else if (arg == "--warmup") {
@@ -73,7 +127,7 @@ Config ParseConfig(int argc, char** argv) {
     } else if (arg == "--iters") {
       cfg.iters = ParseInt(NeedValue(i, argc, argv, arg), arg);
     } else if (arg == "--types") {
-      cfg.types = NeedValue(i, argc, argv, arg);
+      cfg.types = ParseDataType(NeedValue(i, argc, argv, arg));
     } else if (arg == "--reference-check-bytes") {
       cfg.reference_check_bytes = ParseSize(NeedValue(i, argc, argv, arg), arg);
     } else if (arg == "--init-only") {
@@ -111,8 +165,15 @@ Config ParseConfig(int argc, char** argv) {
   if (cfg.iters < 0) {
     throw std::invalid_argument("--iters must be >= 0");
   }
-  if (cfg.types != "auto" && cfg.types != "e4m3") {
-    throw std::invalid_argument("--types must be auto or e4m3");
+  const DataType resolved_type = ResolveDataType(cfg);
+  if (cfg.sharp_backend == SharpBackend::kLegacy && resolved_type != DataType::kE4M3) {
+    throw std::invalid_argument("--types f16 is not supported with --sharp-backend legacy");
+  }
+  if (cfg.sharp_backend == SharpBackend::kTmaAsync && resolved_type != DataType::kF16) {
+    throw std::invalid_argument("--types e4m3 is not supported with --sharp-backend tma_async");
+  }
+  if (cfg.sharp_backend == SharpBackend::kTmaAsync && (cfg.bytes % 16) != 0) {
+    throw std::invalid_argument("--bytes must be a multiple of 16 for --sharp-backend tma_async");
   }
   return cfg;
 }

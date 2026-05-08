@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 usage:
-  scripts/run_mnnvl_sharp.sh rack.yaml [--rank-count N] [--rank-selection balanced|prefix] [mnnvl_sharp_allreduce args...]
+  scripts/run_mnnvl_sharp.sh rack.yaml [--rank-count N] [--rank-selection balanced|prefix] [--sharp-backend legacy|tma_async] [mnnvl_sharp_allreduce args...]
 
 The launcher builds the local target if needed, derives the selected rank plan
 from rack.yaml, creates a temporary SSH config and Open MPI rankfile, verifies
@@ -75,14 +75,14 @@ command -v cmake >/dev/null 2>&1 || die "cmake is required"
 command -v mpirun >/dev/null 2>&1 || die "mpirun is required"
 command -v ssh >/dev/null 2>&1 || die "ssh is required"
 
-mkdir -p "$build_dir"
-if [[ ! -x "$exe" ]]; then
+if [[ ! -f "$build_dir/CMakeCache.txt" ]]; then
+  mkdir -p "$build_dir"
   CUDACXX="$cuda_compiler" cmake -S "$repo_root" -B "$build_dir" \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_CUDA_COMPILER="$cuda_compiler" \
     -DCMAKE_CUDA_ARCHITECTURES="$cuda_arch"
-  cmake --build "$build_dir" -j"$(nproc)"
 fi
+cmake --build "$build_dir" -j"$(nproc)"
 
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
@@ -234,6 +234,11 @@ while IFS=$'\t' read -r label _host _port; do
   if [[ "$skip_remote_build" != "1" ]]; then
     ssh -n -F "$ssh_config" "$label" \
       "cd '$app_dir' && CUDACXX='$cuda_compiler' cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CUDA_COMPILER='$cuda_compiler' -DCMAKE_CUDA_ARCHITECTURES='$cuda_arch' && cmake --build build -j\$(nproc)"
+  else
+    ssh -n -F "$ssh_config" "$label" "mkdir -p '$remote_build_dir'"
+    remote_tmp="$remote_exe.tmp.$$"
+    scp -F "$ssh_config" "$exe" "$label:$remote_tmp"
+    ssh -n -F "$ssh_config" "$label" "mv '$remote_tmp' '$remote_exe' && chmod +x '$remote_exe'"
   fi
   ssh -n -F "$ssh_config" "$label" test -x "$remote_exe"
 done < "$entries_file"

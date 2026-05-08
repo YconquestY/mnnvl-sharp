@@ -100,12 +100,29 @@ uint8_t SemanticByteForElement(std::size_t element_index, int ranks) {
   return EncodeE4M3(acc);
 }
 
+uint16_t SemanticF16ForElement(std::size_t element_index, int ranks) {
+  float acc = 0.0f;
+  for (int rank = 0; rank < ranks; ++rank) {
+    const float value = HalfBitsToFloat(DeterministicF16Bits(rank, element_index));
+    acc = RoundToFp16(acc + value);
+  }
+  return FloatToHalfBits(acc);
+}
+
 int OrderedFiniteE4M3Code(uint8_t bits) {
   const int magnitude = bits & 0x7f;
   if (bits & 0x80) {
     return 0x80 - magnitude;
   }
   return 0x80 + magnitude;
+}
+
+int OrderedFiniteF16Code(uint16_t bits) {
+  const int magnitude = bits & 0x7fff;
+  if (bits & 0x8000u) {
+    return 0x8000 - magnitude;
+  }
+  return 0x8000 + magnitude;
 }
 
 }  // namespace
@@ -125,6 +142,22 @@ uint32_t DeterministicE4M3Word(int rank, std::size_t word_index) {
     word |= static_cast<uint32_t>(DeterministicE4M3Byte(rank, word_index * 4 + lane)) << (lane * 8);
   }
   return word;
+}
+
+uint16_t DeterministicF16Bits(int rank, std::size_t element_index) {
+  static constexpr uint16_t kValues[] = {
+      0xb800u,  // -0.5
+      0xb400u,  // -0.25
+      0xb000u,  // -0.125
+      0x0000u,  //  0.0
+      0x3000u,  //  0.125
+      0x3400u,  //  0.25
+      0x3800u,  //  0.5
+      0x0000u,  //  0.0
+  };
+  const uint32_t mix = static_cast<uint32_t>((element_index * 13u) ^ (element_index >> 5) ^
+                                            (static_cast<std::size_t>(rank + 1) * 7u));
+  return kValues[mix & 7u];
 }
 
 float DecodeE4M3(uint8_t bits) {
@@ -191,6 +224,14 @@ uint8_t EncodeE4M3(float value) {
                               static_cast<uint8_t>(mant));
 }
 
+float DecodeF16(uint16_t bits) {
+  return HalfBitsToFloat(bits);
+}
+
+uint16_t EncodeF16(float value) {
+  return FloatToHalfBits(value);
+}
+
 float RoundToFp16(float value) {
   return HalfBitsToFloat(FloatToHalfBits(value));
 }
@@ -213,6 +254,26 @@ std::vector<float> CpuAllReduceE4M3F32(std::size_t element_count, int ranks) {
     float acc = 0.0f;
     for (int rank = 0; rank < ranks; ++rank) {
       acc += DecodeE4M3(DeterministicE4M3Byte(rank, element));
+    }
+    out[element] = acc;
+  }
+  return out;
+}
+
+std::vector<uint16_t> CpuAllReduceF16Semantic(std::size_t element_count, int ranks) {
+  std::vector<uint16_t> out(element_count);
+  for (std::size_t element = 0; element < element_count; ++element) {
+    out[element] = SemanticF16ForElement(element, ranks);
+  }
+  return out;
+}
+
+std::vector<float> CpuAllReduceF16F32(std::size_t element_count, int ranks) {
+  std::vector<float> out(element_count);
+  for (std::size_t element = 0; element < element_count; ++element) {
+    float acc = 0.0f;
+    for (int rank = 0; rank < ranks; ++rank) {
+      acc += HalfBitsToFloat(DeterministicF16Bits(rank, element));
     }
     out[element] = acc;
   }
@@ -248,6 +309,35 @@ PrecisionMetrics CompareE4M3(const uint32_t* result_words, std::size_t word_coun
     }
   }
   metrics.mean_abs_error = word_count == 0 ? 0.0 : abs_sum / static_cast<double>(word_count * 4);
+  return metrics;
+}
+
+PrecisionMetrics CompareF16(const uint16_t* result, std::size_t element_count, int ranks) {
+  PrecisionMetrics metrics;
+  const std::vector<uint16_t> semantic = CpuAllReduceF16Semantic(element_count, ranks);
+  const std::vector<float> f32 = CpuAllReduceF16F32(element_count, ranks);
+  double abs_sum = 0.0;
+
+  for (std::size_t element = 0; element < element_count; ++element) {
+    const uint16_t got_bits = result[element];
+    const uint16_t expected_bits = semantic[element];
+    if (got_bits != expected_bits) {
+      ++metrics.exact_mismatches;
+    }
+    const float got = HalfBitsToFloat(got_bits);
+    const float err = std::fabs(got - f32[element]);
+    metrics.max_abs_error = std::max(metrics.max_abs_error, err);
+    abs_sum += err;
+    const uint16_t requantized_bits = FloatToHalfBits(f32[element]);
+    if (got_bits != requantized_bits) {
+      ++metrics.requantized_mismatches;
+    }
+    metrics.max_requantized_ulp_distance =
+        std::max(metrics.max_requantized_ulp_distance,
+                 std::abs(OrderedFiniteF16Code(got_bits) -
+                          OrderedFiniteF16Code(requantized_bits)));
+  }
+  metrics.mean_abs_error = element_count == 0 ? 0.0 : abs_sum / static_cast<double>(element_count);
   return metrics;
 }
 

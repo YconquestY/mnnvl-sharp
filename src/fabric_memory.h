@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "config.h"
 #include "runtime.h"
 
 namespace mnnvl {
@@ -15,6 +16,10 @@ namespace mnnvl {
 struct FabricAllocation {
   std::size_t payload_bytes = 0;
   std::size_t alloc_bytes = 0;
+  std::size_t input_offset = 0;
+  std::size_t output_offset = 0;
+  std::size_t multicast_bytes = 0;
+  std::size_t multicast_bind_offset = 0;
   std::size_t vmm_granularity = 0;
   std::size_t multicast_granularity = 0;
 
@@ -34,7 +39,10 @@ struct FabricAllocation {
 };
 
 std::size_t AlignUp(std::size_t value, std::size_t alignment);
-FabricAllocation CreateFabricAllocation(MPI_Comm world, const RankInfo& rank, std::size_t payload_bytes);
+FabricAllocation CreateFabricAllocation(MPI_Comm world,
+                                        const RankInfo& rank,
+                                        std::size_t payload_bytes,
+                                        SharpBackend backend);
 void DestroyFabricAllocation(const RankInfo& rank, FabricAllocation* allocation);
 
 }  // namespace mnnvl

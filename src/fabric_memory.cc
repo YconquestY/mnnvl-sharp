@@ -69,7 +69,10 @@ std::size_t AlignUp(std::size_t value, std::size_t alignment) {
   return ((value + alignment - 1) / alignment) * alignment;
 }
 
-FabricAllocation CreateFabricAllocation(MPI_Comm world, const RankInfo& rank, std::size_t payload_bytes) {
+FabricAllocation CreateFabricAllocation(MPI_Comm world,
+                                        const RankInfo& rank,
+                                        std::size_t payload_bytes,
+                                        SharpBackend backend) {
   FabricAllocation allocation;
   allocation.payload_bytes = payload_bytes;
   int world_size = 0;
@@ -87,7 +90,21 @@ FabricAllocation CreateFabricAllocation(MPI_Comm world, const RankInfo& rank, st
                                            CU_MULTICAST_GRANULARITY_MINIMUM));
 
   const std::size_t granularity = std::max(allocation.vmm_granularity, allocation.multicast_granularity);
-  allocation.alloc_bytes = AlignUp(payload_bytes, granularity);
+  if (backend == SharpBackend::kLegacy) {
+    allocation.input_offset = 0;
+    allocation.output_offset = 0;
+    allocation.multicast_bind_offset = 0;
+    allocation.multicast_bytes = AlignUp(payload_bytes, granularity);
+    allocation.alloc_bytes = allocation.multicast_bytes;
+  } else {
+    const std::size_t input_region_bytes = AlignUp(payload_bytes, granularity);
+    const std::size_t output_region_bytes = AlignUp(payload_bytes, granularity);
+    allocation.input_offset = 0;
+    allocation.output_offset = input_region_bytes;
+    allocation.multicast_bind_offset = allocation.output_offset;
+    allocation.multicast_bytes = output_region_bytes;
+    allocation.alloc_bytes = input_region_bytes + output_region_bytes;
+  }
 
   MNNVL_CHECK_CU(cuMemCreate(&allocation.local_handle, allocation.alloc_bytes, &alloc_prop, 0));
 
@@ -124,7 +141,7 @@ FabricAllocation CreateFabricAllocation(MPI_Comm world, const RankInfo& rank, st
   MPI_Allgather(&allocation.peer_init_local_ms, 1, MPI_DOUBLE,
                 allocation.peer_init_all_ms.data(), 1, MPI_DOUBLE, world);
 
-  CUmulticastObjectProp mc_prop = MulticastProp(allocation.alloc_bytes, world_size);
+  CUmulticastObjectProp mc_prop = MulticastProp(allocation.multicast_bytes, world_size);
   CUmemFabricHandle mc_fabric{};
   if (rank.world_rank == 0) {
     MNNVL_CHECK_CU(cuMulticastCreate(&allocation.multicast_handle, &mc_prop));
@@ -142,12 +159,13 @@ FabricAllocation CreateFabricAllocation(MPI_Comm world, const RankInfo& rank, st
   MPI_Barrier(world);
 
   MNNVL_CHECK_CU(cuMulticastBindMem_v2(allocation.multicast_handle, rank.cu_device, 0,
-                                       allocation.local_handle, 0, allocation.alloc_bytes, 0));
+                                       allocation.local_handle, allocation.multicast_bind_offset,
+                                       allocation.multicast_bytes, 0));
   allocation.multicast_bound = true;
   MPI_Barrier(world);
 
-  MNNVL_CHECK_CU(cuMemAddressReserve(&allocation.mc_base, allocation.alloc_bytes, granularity, 0, 0));
-  MapAllocation(allocation.mc_base, allocation.alloc_bytes, allocation.multicast_handle, access);
+  MNNVL_CHECK_CU(cuMemAddressReserve(&allocation.mc_base, allocation.multicast_bytes, granularity, 0, 0));
+  MapAllocation(allocation.mc_base, allocation.multicast_bytes, allocation.multicast_handle, access);
   MPI_Barrier(world);
   return allocation;
 }
@@ -158,12 +176,12 @@ void DestroyFabricAllocation(const RankInfo& rank, FabricAllocation* allocation)
   }
 
   if (allocation->mc_base != 0) {
-    cuMemUnmap(allocation->mc_base, allocation->alloc_bytes);
-    cuMemAddressFree(allocation->mc_base, allocation->alloc_bytes);
+    cuMemUnmap(allocation->mc_base, allocation->multicast_bytes);
+    cuMemAddressFree(allocation->mc_base, allocation->multicast_bytes);
     allocation->mc_base = 0;
   }
   if (allocation->multicast_bound) {
-    cuMulticastUnbind(allocation->multicast_handle, rank.cu_device, 0, allocation->alloc_bytes);
+    cuMulticastUnbind(allocation->multicast_handle, rank.cu_device, 0, allocation->multicast_bytes);
     allocation->multicast_bound = false;
   }
   if (allocation->uc_base != 0) {

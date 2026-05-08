@@ -73,6 +73,7 @@ def run_one(launcher: pathlib.Path,
             rack_yaml: pathlib.Path,
             rank_count: int,
             rank_selection: str,
+            sharp_backend: str,
             repeat: int,
             log_path: pathlib.Path) -> dict[str, Any]:
     cmd = [
@@ -82,6 +83,8 @@ def run_one(launcher: pathlib.Path,
         str(rank_count),
         "--rank-selection",
         rank_selection,
+        "--sharp-backend",
+        sharp_backend,
         "--init-only",
         "--json",
     ]
@@ -97,6 +100,7 @@ def main() -> int:
     parser.add_argument("rack_yaml", type=pathlib.Path)
     parser.add_argument("--rank-counts", default=",".join(str(x) for x in DEFAULT_RANK_COUNTS))
     parser.add_argument("--rank-selection", choices=["balanced", "prefix"], default="balanced")
+    parser.add_argument("--sharp-backend", choices=["legacy", "tma_async"], default="legacy")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--out-dir", type=pathlib.Path, default=pathlib.Path("results/init_sweep"))
     parser.add_argument("--launcher", type=pathlib.Path, default=pathlib.Path("scripts/run_mnnvl_sharp.sh"))
@@ -122,10 +126,12 @@ def main() -> int:
     for rank_count in rank_counts:
         for repeat in range(args.repeats):
             log_path = args.out_dir / f"rank_{rank_count}_repeat_{repeat}.log"
-            summary = run_one(launcher, rack_yaml, rank_count, args.rank_selection, repeat, log_path)
+            summary = run_one(launcher, rack_yaml, rank_count, args.rank_selection,
+                              args.sharp_backend, repeat, log_path)
             rows.append({
                 "rank_count": rank_count,
                 "repeat": repeat,
+                "sharp_backend": args.sharp_backend,
                 "peer_init_ms": summary["peer_init_ms"],
                 "peer_init_min_ms": summary["peer_init_min_ms"],
                 "peer_init_median_ms": summary["peer_init_median_ms"],
@@ -137,6 +143,7 @@ def main() -> int:
         fieldnames = [
             "rank_count",
             "repeat",
+            "sharp_backend",
             "peer_init_ms",
             "peer_init_min_ms",
             "peer_init_median_ms",

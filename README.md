@@ -4,11 +4,13 @@ This repository contains a standalone CUDA 13.1 + MPI sample named
 `mnnvl_sharp_allreduce`. It reads a rack YAML inventory, launches one MPI rank
 per selected GPU, allocates fabric-shareable GPU memory with CUDA Driver API
 VMM, maps symmetric unicast peer slots, creates an NVLink multicast alias, and
-uses NVLink SHARP through PTX `multimem` for an FP8 E4M3 all-reduce.
+uses NVLink SHARP through selectable PTX `multimem` backends.
 
 The datatype policy is explicit:
 
-- `FP8 E4M3`: supported and executed through the compiled `multimem` kernel path.
+- `FP8 E4M3`: supported with `--sharp-backend legacy`.
+- `F16`: supported with `--sharp-backend tma_async` when CUDA 13.1/PTX 9.1
+  accepts `multimem.cp.reduce.async.bulk`.
 - `NVFP4`: reported unsupported under this CUDA 13.1 raw `multimem` path.
 - `MXFP4`: reported unsupported under this CUDA 13.1 raw `multimem` path.
 
@@ -54,7 +56,9 @@ cmake --build build -j
 ```
 
 The CMake configure step queries `nvcc` and fails if a Blackwell target required
-for FP8 `multimem` support is unavailable.
+for FP8 `multimem` support is unavailable. It also probes the PTX 9.1 TMA-based
+multimem reduction instruction and compiles the `tma_async` backend only when
+the local CUDA compiler accepts it.
 
 ## Preflight
 
@@ -89,6 +93,19 @@ Launch the default full YAML inventory:
 
 ```bash
 scripts/run_mnnvl_sharp.sh /absolute/path/to/rack.yaml \
+  --sharp-backend legacy \
+  --bytes 1073741824 \
+  --warmup 3 \
+  --iters 20 \
+  --reference-check-bytes 16777216
+```
+
+Launch the TMA async F16 backend:
+
+```bash
+scripts/run_mnnvl_sharp.sh /absolute/path/to/rack.yaml \
+  --sharp-backend tma_async \
+  --types auto \
   --bytes 1073741824 \
   --warmup 3 \
   --iters 20 \
@@ -109,6 +126,13 @@ Rank selection policies:
 
 - `balanced`: slot 0 across all trays, then slot 1 across all trays, and so on.
 - `prefix`: trays in YAML order, then devices in each tray's listed order.
+
+Backend and datatype policies:
+
+- `--types auto` selects `e4m3` for `legacy` and `f16` for `tma_async`.
+- `--types e4m3 --sharp-backend tma_async` is rejected.
+- `--types f16 --sharp-backend legacy` is rejected.
+- `tma_async` requires `--bytes` to be 16-byte aligned.
 
 The launcher derives `mpirun -np <rank-count>`, per-host slots, a temporary SSH
 config from each entry's `hostname` and `port`, and an Open MPI rankfile so
