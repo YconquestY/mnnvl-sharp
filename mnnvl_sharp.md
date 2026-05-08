@@ -4,8 +4,8 @@
 - Build a standalone sample named `mnnvl_sharp_allreduce`.
 - Use CUDA Toolkit 13.1, `MPI + CUDA Driver API`, and one rank per selected GPU.
 - Read the available rank inventory from one rack YAML file: up to 18 compute trays, up to 4 GPUs per tray, and up to 72 ranks total.
-- Use raw CUDA virtual memory management, IMEX fabric handles, multicast objects, and `multimem` PTX so the sample explicitly exercises MNNVL symmetric memory and NVLink SHARP.
-- Execute the SHARP path only for `FP8 E4M3`; report `NVFP4` and `MXFP4` unsupported under the chosen CUDA 13.1 programming path.
+- Use raw CUDA virtual memory management, IMEX fabric handles, multicast objects, and selectable `multimem` PTX SHARP backends so the sample explicitly exercises MNNVL symmetric memory and NVLink SHARP.
+- Execute `FP8 E4M3` through the legacy multimem backend and F16 through the TMA async backend; report `NVFP4` and `MXFP4` unsupported under the chosen CUDA 13.1 programming paths.
 - Assume the rack remains on the default 72-GPU NVLink partition and that the selected trays are members of the same healthy IMEX domain. In the single-user setup, `channel0` on each selected node is sufficient.
 - Measure peer-access initialization latency separately from SHARP all-reduce latency, and provide a sweep workflow that plots initialization latency versus rank count.
 
@@ -14,10 +14,11 @@
   - `--rack-config rack.yaml`
   - `--rank-count <N>`
   - `--rank-selection balanced|prefix`
+  - `--sharp-backend legacy|tma_async`
   - `--bytes 1073741824`
   - `--warmup 3`
   - `--iters 20`
-  - `--types auto|e4m3`
+  - `--types auto|e4m3|f16`
   - `--reference-check-bytes 16777216`
   - `--init-only`
   - `--json`
@@ -83,19 +84,29 @@
   - Every rank adds its local GPU to the multicast object and binds its own local allocation with `cuMulticastBindMem`.
   - Every rank maps one multicast alias `mc_alias` to the same physical memory already visible through `uc_slots[self]`.
   - Use `fence.proxy.alias` before SHARP reads and before post-SHARP unicast validation reads.
-  - Run the SHARP kernel on global rank 0 only:
+  - `--sharp-backend legacy` uses the existing rank-0 synchronous multimem reduction kernel:
     - grid-stride over packed `e4m3x4`
     - `multimem.ld_reduce.add.acc::f16.e4m3x4`
     - `multimem.st.e4m3x4`
+  - `--sharp-backend tma_async` uses the PTX 9.1 TMA bulk async reduction path:
+    - all ranks launch a contributor kernel
+    - stage F16 tiles in shared memory
+    - issue `fence.proxy.async` after zeroing the destination and before the first async reduction that observes it
+    - reduce into the multicast destination with `multimem.cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.f16`
+    - commit and wait for the bulk async group before validation or timing stop
 - Datatype and reference handling:
   - Runtime datatype reporting is split into device multicast support and compiled `multimem` support for the local Blackwell target.
   - Report:
-    - `FP8 E4M3`: supported
+    - `FP8 E4M3`: supported with `--sharp-backend legacy`
+    - `F16`: supported with `--sharp-backend tma_async`
     - `NVFP4`: unsupported
     - `MXFP4`: unsupported
-  - Implement deterministic `E4M3` initialization using packed `e4m3x4`.
+  - Implement deterministic `E4M3` initialization using packed `e4m3x4` and deterministic F16 initialization for the TMA async path.
+  - For `legacy`, reduce packed `E4M3` directly and compare the quantized `E4M3` result.
+  - For `tma_async`, use an F16 working/output representation because `multimem.cp.reduce.async.bulk` supports `.f16/.bf16/.f32/...` but not `.e4m3`.
+  - `--types auto` selects `e4m3` for `legacy` and `f16` for `tma_async`.
   - Compare the SHARP result against:
-    - a semantic CPU reference: `E4M3 -> F16 accumulation -> E4M3`
+    - a backend-specific semantic CPU reference
     - a precision CPU reference: `float32`
   - Use full-buffer hashes for replica identity and sampled host comparison by default for precision metrics.
 - Rank sweep and graph:
@@ -133,8 +144,10 @@
   - write per-rank canaries into `uc_slots[self]`
   - read back peer canaries from every imported remote slot
 - Functional test:
-  - `auto` type query must execute only `FP8 E4M3`
+  - `auto` type query must execute `FP8 E4M3` on `legacy` and F16 on `tma_async`
   - `NVFP4` and `MXFP4` must be reported unsupported and skipped
+  - `--sharp-backend legacy` must use the rank-0 `multimem.ld_reduce` path
+  - `--sharp-backend tma_async` must use `multimem.cp.reduce.async.bulk` and report unsupported if PTX 9.1 support is unavailable
 - Correctness test:
   - reconstruct the selected-rank input buffers on CPU on rank 0
   - compare against both semantic and precision CPU references
@@ -144,7 +157,7 @@
   - peer-access initialization timing is reported for every run
   - reinitialize before each measured iteration
   - 3 warmups, 20 measured iterations
-  - CUDA events around only the SHARP kernel on rank 0
+  - CUDA events around the backend SHARP work: rank 0 only for `legacy`, all ranks with max reduction for `tma_async`
   - report min/median/p95 latency and effective logical all-reduce bandwidth
 - Sweep test:
   - run `4, 8, 16, 32, 64, 72` rank counts when available
@@ -156,7 +169,8 @@
 - Rack YAML order defines tray order and rank-selection input order.
 - The default rack configuration is one healthy 72-GPU NVLink partition.
 - A rack-wide IMEX domain is acceptable even if the job uses only a subset of trays, as long as the selected trays are healthy members of that same domain.
-- The only SHARP-relevant datatype from the candidate list on CUDA 13.1 GB200 is `FP8 E4M3`; `NVFP4` and `MXFP4` are not directly exposed by CUDA 13.1 `multimem` reductions.
+- From the original candidate list, the legacy backend supports `FP8 E4M3`; `NVFP4` and `MXFP4` are not directly exposed by CUDA 13.1 `multimem` reductions.
+- The TMA async backend uses F16 because PTX 9.1 `multimem.cp.reduce.async.bulk` supports F16/BF16/F32-style element types but not packed E4M3.
 - Primary references:
   - [IMEX overview](https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/overview.html)
   - [IMEX getting started](https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/gettingstarted.html)
@@ -164,5 +178,5 @@
   - [IMEX deployment](https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/deployment.html)
   - [CUDA 13.1 programming guide](https://docs.nvidia.com/cuda/archive/13.1.0/cuda-programming-guide/index.html)
   - [CUDA 13.1 driver API](https://docs.nvidia.com/cuda/archive/13.1.0/cuda-driver-api/index.html)
-  - [PTX multimem support](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html)
+  - [PTX ISA 9.1 multimem support](https://docs.nvidia.com/cuda/archive/13.1.1/parallel-thread-execution/index.html)
   - [NVIDIA multi-gpu-programming-models](https://github.com/NVIDIA/multi-gpu-programming-models)

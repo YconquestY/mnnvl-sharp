@@ -4,8 +4,8 @@
 - Implement a standalone CUDA 13.1 + MPI sample named `mnnvl_sharp_allreduce`.
 - The sample will run one MPI rank per selected GPU, with the selected ranks drawn from a rack YAML file that can describe up to 18 compute trays and up to 4 GPUs per tray.
 - The selected CUDA containers, SSH/control-plane addresses, SSH ports, and local CUDA device indices will come from the rack YAML file.
-- The implementation will use CUDA Driver API virtual memory management, IMEX fabric handles, multicast objects, and inline PTX `multimem` instructions for the SHARP path.
-- The sample will only execute the SHARP all-reduce for `FP8 E4M3`. It will detect and report `NVFP4` and `MXFP4` as unsupported under the chosen CUDA 13.1 programming path.
+- The implementation will use CUDA Driver API virtual memory management, IMEX fabric handles, multicast objects, and selectable inline PTX `multimem` SHARP backends.
+- The sample will execute `FP8 E4M3` through the legacy multimem backend and F16 through the TMA async backend. It will detect and report `NVFP4` and `MXFP4` as unsupported under the chosen CUDA 13.1 programming paths.
 - The sample will produce correctness, precision, SHARP timing, and peer-access initialization timing output in a single run.
 - The benchmark tooling will sweep rank counts `4, 8, 16, 32, 64, 72` from the same rack YAML and generate an initialization-latency graph.
 - The implementation assumes the rack remains on the default 72-GPU NVLink partition and that the selected trays are members of the same IMEX domain.
@@ -42,9 +42,9 @@
 - `src/fabric_memory.*`
   - Own all CUDA Driver API VMM work: local allocation, fabric-handle export/import, symmetric unicast mapping, multicast object creation/import, binding, access setup, and teardown.
 - `src/sharp_kernels.cu`
-  - Own deterministic buffer initialization, alias fences, SHARP `multimem` kernel, byte hash kernel, and device-side helpers.
+  - Own deterministic buffer initialization, alias fences, legacy SHARP `multimem` kernel, TMA async SHARP kernel, byte hash kernel, and device-side helpers.
 - `src/e4m3_ref.*`
-  - Own host-side `E4M3` encode/decode, CPU semantic all-reduce reference, and precision metrics.
+  - Own host-side `E4M3` encode/decode, F16 helpers, CPU semantic all-reduce references, and precision metrics.
 - `scripts/preflight_imex.sh`
   - Validate host prerequisites before attempting the run.
 - `scripts/run_mnnvl_sharp.sh`
@@ -77,6 +77,7 @@
   - Detect supported GPU code via `nvcc --list-gpu-code` during configure.
   - Fail configuration if the compiler does not expose the Blackwell target needed for `multimem` `E4M3` support.
   - Export a compile definition such as `MNNVL_SHARP_HAS_E4M3=1` only when that check passes.
+  - Detect PTX ISA support for `multimem.cp.reduce.async.bulk` and export `MNNVL_SHARP_HAS_TMA_ASYNC=1` only when CUDA 13.1/PTX 9.1 support is present.
 - Default build type: `RelWithDebInfo`.
 
 ## CLI and Runtime Contract
@@ -84,10 +85,11 @@
   - `--rack-config rack.yaml`
   - `--rank-count <N>` with default `MPI_COMM_WORLD` size
   - `--rank-selection balanced|prefix` with default `balanced`
+  - `--sharp-backend legacy|tma_async` with default `legacy`
   - `--bytes 1073741824`
   - `--warmup 3`
   - `--iters 20`
-  - `--types auto|e4m3`
+  - `--types auto|e4m3|f16`
   - `--reference-check-bytes <N>` with default `16777216`
   - `--init-only` to stop after peer-access initialization, smoke test, and JSON reporting
   - `--json` to emit one machine-readable summary line
@@ -127,6 +129,11 @@
   - `--rank-count` is the number of ranks selected from the full YAML inventory and must match `MPI_COMM_WORLD` size when provided.
   - `--rank-selection balanced` selects device slot 0 across all trays, then slot 1 across all trays, and so on until `N` ranks are selected.
   - `--rank-selection prefix` selects trays in YAML order and devices in each tray's listed order until `N` ranks are selected.
+  - `--sharp-backend legacy` uses the existing rank-0 `multimem.ld_reduce` plus `multimem.st` kernel.
+  - `--sharp-backend tma_async` uses the PTX 9.1 `multimem.cp.reduce.async.bulk` instruction and requires `MNNVL_SHARP_HAS_TMA_ASYNC=1`.
+  - `--types auto` selects `e4m3` for `legacy` and `f16` for `tma_async`.
+  - `--types e4m3 --sharp-backend tma_async` is rejected because PTX 9.1 `multimem.cp.reduce.async.bulk` does not expose an `.e4m3` element type.
+  - `--types f16 --sharp-backend legacy` is rejected for v1 because the legacy implementation only ships the packed `e4m3x4` kernel.
   - `--reference-check-bytes` is the number of leading payload bytes compared against CPU references for exactness and precision metrics.
   - Set `--reference-check-bytes` equal to `--bytes` for a full-buffer CPU reference.
 - Invariants:
@@ -216,6 +223,7 @@
   - rack config path
   - optional rank count
   - rank-selection policy
+  - SHARP backend selection
   - reference-check byte count
   - byte counts
   - iteration counts
@@ -262,16 +270,20 @@
   - `fabric_handle_supported`
   - `multicast_supported`
   - `sharp_e4m3_supported`
+  - `sharp_tma_async_supported`
   - `nvfp4_supported`
   - `mxfp4_supported`
 - `FabricAllocation`
   - local allocation handle
   - rounded allocation size
+  - backend-specific allocation layout
   - exported opaque fabric handle bytes
   - local unicast base VA
   - vector-backed slot pointers `uc_slots[world_size]`
   - multicast object handle
   - multicast alias pointer `mc_alias`
+  - for `legacy`: one payload region containing packed `e4m3x4`
+  - for `tma_async`: an input region and a zero-initialized F16 output region used as the multicast reduction destination
 - `RunStats`
   - peer-access initialization local latency
   - peer-access initialization min, median, p95, max across ranks
@@ -286,10 +298,14 @@
 ## Memory and Handle Exchange Design
 - Local allocation per rank:
   - Call `cudaSetDevice(gpu_ordinal)` first so runtime and driver APIs share the same primary context.
-  - Create a local 1 GiB physical allocation with `cuMemCreate` using a device-local allocation property and fabric-shareable handle type.
+  - Create a local physical allocation with `cuMemCreate` using a device-local allocation property and fabric-shareable handle type.
+  - For `legacy`, allocate one `payload_bytes` region for packed `e4m3x4` input/output.
+  - For `tma_async`, allocate an input region plus an F16 output region, each `payload_bytes` unless the implementation later exposes separate sizing.
+  - Zero the TMA output region on every rank before each TMA reduction because `multimem.cp.reduce.async.bulk` adds into the current destination contents.
+  - After zeroing through the generic proxy, issue a generic-to-async proxy fence before the TMA async reduction kernel observes the output region.
   - Query allocation granularity via `cuMemGetAllocationGranularity`.
   - Query multicast granularity via `cuMulticastGetGranularity`.
-  - Round `bytes` up to `alloc_bytes = align_up(bytes, max(vmm_granularity, mc_granularity))`.
+  - Round the backend-specific total allocation size up to `alloc_bytes = align_up(layout_bytes, max(vmm_granularity, mc_granularity))`.
 - Export/import:
   - Run `MPI_Barrier(world)` immediately before peer-access initialization.
   - Start a local wall-clock timer with `MPI_Wtime()`.
@@ -304,11 +320,12 @@
   - Use `MPI_Allgather` or `MPI_Allreduce` to report per-rank peer-init latencies and the global max latency.
   - Publish `uc_slots[world_size]` in global-rank order.
 - Multicast object:
-  - Rank 0 creates a single multicast object sized to `alloc_bytes` and configured for `world_size` devices.
+  - Rank 0 creates a single multicast object sized to the backend's reduction destination region and configured for `world_size` devices.
   - Rank 0 exports the multicast shareable handle and broadcasts it via MPI.
   - All ranks import the multicast object handle.
   - Each rank adds its local GPU to the multicast object.
-  - Each rank binds its own local physical allocation into the multicast object for the full range.
+  - For `legacy`, each rank binds its packed `E4M3` payload region.
+  - For `tma_async`, each rank binds only its F16 output region as the multimem destination.
 - Multicast alias mapping:
   - Reserve a second VA range of size `alloc_bytes`.
   - Map the imported multicast object into this range.
@@ -335,6 +352,7 @@
    - all GPUs support VMM, fabric handles, and multicast
 6. Determine datatype support:
    - `FP8 E4M3` is enabled only when both compile-time and runtime checks pass.
+   - TMA async backend is enabled only when `MNNVL_SHARP_HAS_TMA_ASYNC=1` and runtime multicast support is present.
    - `NVFP4` and `MXFP4` are always reported unsupported in this implementation.
 7. Allocate local physical fabric memory without mapping peer slots.
 8. Run timed peer-access initialization:
@@ -351,12 +369,15 @@
    - all ranks read the canaries from all selected rank slots
    - fail immediately if any readback mismatches
 11. If `--init-only` is set, print JSON/human summary and skip SHARP all-reduce, CPU reference, and timing loops.
-12. Initialize the local buffer for the supported datatype.
+12. Initialize the local buffer for the selected backend:
+    - `legacy`: packed `E4M3` input/output region
+    - `tma_async`: deterministic F16 input region and zeroed F16 output region
 13. Run warmup iterations:
     - reinitialize local buffer
     - global barrier
     - alias fence
-    - SHARP kernel on rank 0
+    - `legacy`: SHARP kernel on rank 0
+    - `tma_async`: contributor kernel on every rank
     - global barrier
 14. Run measured iterations:
     - same flow as warmup
@@ -375,15 +396,25 @@
 - `alias_fence_kernel()`
   - Single-block helper that issues `fence.proxy.alias`.
   - Launch:
-    - after unicast initialization and before the rank-0 SHARP read
+    - after unicast initialization and before the legacy rank-0 SHARP read
     - after the SHARP store and before unicast-side validation reads
-- `sharp_allreduce_e4m3_kernel(uint32_t* mc_alias_words, size_t word_count)`
+- `sharp_allreduce_e4m3_legacy_kernel(uint32_t* mc_alias_words, size_t word_count)`
   - Only rank 0 launches this kernel.
   - One thread processes one packed `e4m3x4` word.
   - Inline PTX flow:
     - `multimem.ld_reduce.add.acc::f16.e4m3x4` from `mc_alias_words[i]`
     - `multimem.st.e4m3x4` back to `mc_alias_words[i]`
   - Use a grid-stride loop for the full 1 GiB region.
+- `sharp_allreduce_f16_tma_async_kernel(half* local_input, half* mc_output, size_t element_count)`
+  - Every rank launches this kernel so every rank contributes its local data.
+  - Each CTA processes one or more contiguous 16-byte-aligned tiles.
+  - Issue `fence.proxy.async` before the first async reduction if the zeroing was performed by ordinary global-memory writes.
+  - Load a tile from the local F16 input region into shared memory.
+  - Issue `multimem.cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.f16 [mc_output + offset], [shared_tile], tile_bytes`.
+  - Use the PTX bulk async-group commit and wait sequence so the kernel does not exit until all issued reductions are complete.
+  - Rely on completion observation to make the async-proxy writes visible to later generic-proxy validation reads.
+  - Require source shared-memory address, destination multimem address, and tile byte count to be 16-byte aligned.
+  - Use grid-stride tiling for the full payload.
 - `hash_kernel(const uint32_t* words, size_t word_count, uint64_t* out_hash)`
   - Produce one 64-bit hash per rank for fast identity comparison across replicas.
 - `canary_kernel(uint32_t* self_slot, uint32_t rank_tag)`
@@ -391,15 +422,18 @@
 
 ## Datatype Handling
 - Reported support matrix:
-  - `FP8 E4M3`: executable
+  - `FP8 E4M3`: executable with `--sharp-backend legacy`
+  - `F16`: executable with `--sharp-backend tma_async`
   - `NVFP4`: reported unsupported
   - `MXFP4`: reported unsupported
 - Reasoning encoded into the program:
   - runtime support for SHARP requires multicast capability on the device
   - executable datatype support requires a compiled `multimem` kernel path
-  - this implementation only ships an `E4M3` kernel because CUDA 13.1 does not expose a direct `NVFP4` or `MXFP4` SHARP reduction path through the chosen `multimem` API
+  - legacy backend ships an `E4M3` kernel because CUDA 13.1 exposes packed `e4m3x4` support through `multimem.ld_reduce`
+  - TMA async backend ships an F16 kernel because `multimem.cp.reduce.async.bulk` supports `.f16/.bf16/.f32/...` and does not expose an `.e4m3` type
+  - CUDA 13.1 does not expose a direct `NVFP4` or `MXFP4` SHARP reduction path through either chosen backend
 - Output example:
-  - `datatype_support: {"e4m3":"supported","nvfp4":"unsupported","mxfp4":"unsupported"}`
+  - `datatype_support: {"e4m3_legacy":"supported","f16_tma_async":"supported","nvfp4":"unsupported","mxfp4":"unsupported"}`
 
 ## Host Reference and Precision Comparison
 - `src/e4m3_ref.*` will implement:
@@ -408,21 +442,19 @@
   - `float round_to_fp16(float x)`
   - `void cpu_allreduce_e4m3_semantic(...)`
   - `void cpu_allreduce_e4m3_f32(...)`
+  - `void cpu_allreduce_f16_semantic(...)`
+  - `void cpu_allreduce_f16_f32(...)`
 - Semantic reference:
-  - regenerate all selected-rank input buffers using the exact same deterministic formula as the device initializer
-  - decode each `E4M3` element to float
-  - accumulate rank contributions in `FP16` rounding after each add
-  - re-encode the final result to `E4M3`
+  - regenerate all selected-rank input buffers using the exact same deterministic formula as the selected backend initializer
+  - for `legacy`, decode each `E4M3` element to float, accumulate rank contributions in `FP16` rounding after each add, and re-encode the final result to `E4M3`
+  - for `tma_async`, accumulate F16 input values with the selected F16 semantic model and compare against the F16 output region
 - Precision reference:
-  - decode each `E4M3` element to float
-  - accumulate in `float32`
+  - for `legacy`, decode each `E4M3` element to float and accumulate in `float32`
+  - for `tma_async`, decode each F16 element to float and accumulate in `float32`
   - keep the final float32 result for error reporting
 - Comparison policy:
   - against semantic reference: exact byte-for-byte match is required
-  - against float32 reference: report
-    - max absolute decoded error
-    - mean absolute decoded error
-    - mismatch count after `E4M3` requantization
+  - against float32 reference: report max absolute decoded error, mean absolute decoded error, and mismatch count after backend-specific requantization
 - Scaling plan for the CPU reference:
   - default to comparing the first `16 MiB` of payload for precision metrics to keep host cost bounded
   - always compare the full-rank hashes for whole-buffer identity
@@ -438,13 +470,14 @@
   - rank 0 reports min, median, p95, max, and global max over local peer-init timings
   - the sweep graph uses the global max peer-init latency as the y value
 - Device timing:
-  - rank 0 records CUDA events immediately before and after the SHARP kernel
+  - `legacy`: rank 0 records CUDA events immediately before and after the rank-0 SHARP kernel
+  - `tma_async`: every rank records CUDA events around its contributor kernel and rank 0 reports the max elapsed time across ranks
   - report min, median, p95, and max over measured iterations
 - End-to-end timing:
   - all ranks record wall clock time around:
     - pre-kernel barrier
     - alias fence
-    - rank-0 kernel launch
+    - backend SHARP kernel launch
     - post-kernel barrier
   - reduce the maximum wall time across ranks per iteration
   - report min, median, and p95 of the global max latency
@@ -456,6 +489,7 @@
 ## Logging and Output
 - Human-readable summary:
   - rack entry and GPU selection
+  - selected SHARP backend
   - detected NUMA IDs
   - capability matrix
   - datatype support matrix
@@ -471,6 +505,7 @@
     - GPU mapping
     - datatype support
     - selected rank count
+    - selected SHARP backend
     - peer initialization timing
     - exact-match result
     - precision metrics
@@ -533,7 +568,9 @@
 - Each rank allocates and exposes a 1 GiB fabric-shareable GPU allocation.
 - Every rank can read canaries from all selected symmetric unicast slots.
 - The program reports peer-access initialization latency, including global max `peer_init_ms`.
-- The program reports `E4M3` supported and `NVFP4`/`MXFP4` unsupported.
+- The program reports `E4M3` legacy support, F16 TMA async support, and `NVFP4`/`MXFP4` unsupported.
+- `--sharp-backend legacy` executes the rank-0 `multimem.ld_reduce` path.
+- `--sharp-backend tma_async` executes `multimem.cp.reduce.async.bulk` when PTX 9.1 support is available and fails with an actionable error otherwise.
 - The SHARP kernel executes without access faults or mapping errors.
 - All selected-rank replicas produce identical final hashes.
 - Rank 0 reports exact byte match against the CPU semantic reference for the validated region.
@@ -542,25 +579,28 @@
 - The sweep script emits a CSV and PNG graph for rank counts `4, 8, 16, 32, 64, 72` when those counts are available.
 
 ## Implementation Order
-1. Extend CLI parsing for `--rank-count`, `--rank-selection`, and `--init-only`.
+1. Extend CLI parsing for `--rank-count`, `--rank-selection`, `--sharp-backend`, and `--init-only`.
 2. Extend rack YAML parsing to accept 1 to 18 entries and 1 to 4 devices per entry.
 3. Implement rank-plan construction, per-container slot derivation, MPI topology discovery, GPU selection, and NUMA validation.
 4. Convert fixed-size rank assumptions in runtime and fabric memory code to `world_size` vectors.
 5. Add timed peer-access initialization around fabric-handle export, all-gather, import, mapping, and access setup.
-6. Update multicast object creation/import, binding, and alias mapping for `world_size` devices.
-7. Update canary, hashing, SHARP, and host-reference paths for variable rank count.
-8. Add JSON fields and human-readable output for peer-init timing.
-9. Add rank-count-aware launcher behavior.
-10. Add sweep and plotting scripts plus README usage documentation.
+6. Update multicast object creation/import, binding, and alias mapping for `world_size` devices and backend-specific destination regions.
+7. Split SHARP kernels into legacy E4M3 and TMA async F16 paths.
+8. Update canary, hashing, and host-reference paths for variable rank count and backend-specific output representation.
+9. Add JSON fields and human-readable output for peer-init timing and selected backend.
+10. Add rank-count-aware launcher behavior.
+11. Add sweep and plotting scripts plus README usage documentation.
 
 ## Risks and Defaults
 - Default: treat rack YAML order as tray order and rank-selection input order. The scripts and README must state this explicitly.
 - Default: `balanced` rank selection spreads small rank counts across trays before taking additional GPUs from the same tray.
+- Default: `--sharp-backend legacy` remains the compatibility path.
 - Default: assume the NVL72 rack remains on the default 72-GPU NVLink partition unless an operator states otherwise.
 - Default: accept a rack-wide IMEX domain even when the job only uses a subset of trays, as long as the selected trays are healthy members of that same domain.
-- Default: only `E4M3` is executable in v1. FP4 support remains a reported capability decision, not a runtime path.
+- Default: `E4M3` is executable on the legacy backend and F16 is executable on the TMA async backend. FP4 support remains a reported capability decision, not a runtime path.
 - Risk: CUDA 13.1 Blackwell toolchain naming may differ across environments. The configure step must fail loudly instead of guessing.
 - Risk: exact SHARP semantic behavior may differ from the planned `FP16` accumulation model. If the first hardware run disagrees, the semantic reference becomes the first item to recalibrate using observed results and PTX documentation.
+- Risk: `multimem.cp.reduce.async.bulk` does not directly support `.e4m3`; the TMA async backend validates F16 output and is not byte-equivalent to the legacy packed-E4M3 backend.
 - Risk: full 1 GiB CPU reference is expensive. The default sampled precision comparison keeps runtime practical while still validating end-to-end correctness through hashes.
 - Risk: `channel0` availability alone does not prove IMEX membership consistency. The preflight must compare `nodes_config.cfg` and `nvidia-imex-ctl -N` state across the selected containers.
 - Risk: if the rack has been split into user partitions, compute-node-only checks will not prove partition compatibility. The runbook must require one switch-side `nv show sdn partition` confirmation before debugging CUDA import failures.
